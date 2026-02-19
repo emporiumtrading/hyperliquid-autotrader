@@ -1,1 +1,1 @@
-"""Regimes: classifier, hysteresis."""
+"""Market regime detection."""

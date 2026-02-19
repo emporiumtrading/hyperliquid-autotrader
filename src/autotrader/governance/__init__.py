@@ -1,1 +1,1 @@
-"""Governance: registry, gates, drift, probation, approvals."""
+"""Strategy governance and deployment gating."""

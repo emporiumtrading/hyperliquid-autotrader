@@ -1,1 +1,1 @@
-"""Data: collectors and transforms."""
+"""Data collectors and transforms for the Hyperliquid autotrader."""

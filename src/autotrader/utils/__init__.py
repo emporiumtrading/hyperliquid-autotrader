@@ -1,1 +1,1 @@
-"""Utils: time, math, config, ids, serialization."""
+"""Shared utility modules: time, math, config, ids, serialization."""

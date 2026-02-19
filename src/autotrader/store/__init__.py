@@ -1,1 +1,1 @@
-"""Store: datastore abstraction, Postgres, Parquet, dataset hash."""
+"""Data storage backends."""

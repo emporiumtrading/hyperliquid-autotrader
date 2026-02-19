@@ -1,1 +1,1 @@
-"""Execution: broker, order manager, slippage, reconciliation."""
+"""Order execution and management."""

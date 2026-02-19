@@ -1,1 +1,1 @@
-"""Risk: constraints, sizing, leverage, exposure, approvals."""
+"""Risk management: constraints, sizing, leverage, approvals."""

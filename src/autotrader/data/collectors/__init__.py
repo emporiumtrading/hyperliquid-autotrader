@@ -1,1 +1,1 @@
-"""Collectors: candles, L2, funding/OI, user state."""
+"""Collectors for candles, L2 book, funding/OI, and user state."""

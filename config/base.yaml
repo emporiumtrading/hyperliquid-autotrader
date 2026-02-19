@@ -4,8 +4,8 @@ env: paper  # paper|canary|live
 hyperliquid:
   rest_url: "https://api.hyperliquid.xyz"
   ws_url: "wss://api.hyperliquid.xyz/ws"
-  account_address: "${HL_ACCOUNT_ADDRESS}"
-  api_wallet_private_key: "${HL_API_WALLET_PRIVATE_KEY}"
+  account_address: "${HL_ACCOUNT_ADDRESS:}"
+  api_wallet_private_key: "${HL_API_WALLET_PRIVATE_KEY:}"
   vault_address: ""  # optional
 
 universe:
@@ -51,5 +51,5 @@ observability:
   log_level: "INFO"
 
 storage:
-  postgres_dsn: "${POSTGRES_DSN}"
+  postgres_dsn: "${POSTGRES_DSN:}"
   dataset_manifest_dir: "data/manifests"

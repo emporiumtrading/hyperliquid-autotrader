@@ -1,1 +1,1 @@
-"""Features: technical, microstructure, positioning."""
+"""Feature computation for signals."""

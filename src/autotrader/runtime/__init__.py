@@ -1,1 +1,1 @@
-"""Runtime: startup checks, kill switch, scheduler."""
+"""Runtime management: startup, shutdown, scheduling."""

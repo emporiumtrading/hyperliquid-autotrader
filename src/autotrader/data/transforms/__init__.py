@@ -1,1 +1,1 @@
-"""Transforms: resample, cleaning."""
+"""Data transforms: resampling, cleaning, and validation."""

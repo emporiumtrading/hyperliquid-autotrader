@@ -1,1 +1,1 @@
-"""Hyperliquid REST/WS client, types, rate limiter, nonces."""
+"""Hyperliquid REST/WS client, types, rate limiter, and nonces."""

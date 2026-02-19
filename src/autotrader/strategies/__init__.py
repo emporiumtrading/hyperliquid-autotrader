@@ -1,1 +1,1 @@
-"""Strategies: base + library + ensemble."""
+"""Trading strategy library."""
