@@ -241,15 +241,14 @@ def compute_metrics(
             m.sharpe_ratio = 0.0
 
         # Sortino ratio (annualised)
-        downside = excess[excess < 0.0]
-        if len(downside) > 0:
-            downside_std = float(np.sqrt((downside**2).mean()))
-            if downside_std > 1e-12:
-                m.sortino_ratio = (excess_mean / downside_std) * np.sqrt(365)
-            else:
-                m.sortino_ratio = 0.0
+        # Correct Sortino: use ALL returns, zeroing out positive ones for
+        # the downside deviation (not just filtering to negatives).
+        downside_returns = excess.clip(upper=0.0)
+        downside_std = float(np.sqrt((downside_returns**2).mean()))
+        if downside_std > 1e-12:
+            m.sortino_ratio = (excess_mean / downside_std) * np.sqrt(365)
         else:
-            # No downside returns observed
+            # No downside deviation -- all returns are positive
             m.sortino_ratio = float(m.sharpe_ratio) if m.sharpe_ratio > 0 else 0.0
 
         # Best / worst day

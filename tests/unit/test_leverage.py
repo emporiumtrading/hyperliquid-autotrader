@@ -80,39 +80,37 @@ class TestLiquidationPrice:
     def test_liquidation_price_long(self):
         """Correct liquidation price for a long position.
 
-        Formula: liq = entry * (1 - 1/leverage + maint_margin_pct)
-        entry=100, leverage=10, maint=0.005 => liq = 100*(1 - 0.1 + 0.005) = 90.5
+        HL formula: liq = entry * (1 - 1/lev) / (1 - mm)
+        entry=100, leverage=10, maint=0.005
+        => liq = 100 * 0.9 / 0.995 = 90.45226...
         """
         liq = compute_liquidation_price(
             entry=100.0, leverage=10.0, is_long=True, maint_margin_pct=0.005
         )
-        assert pytest.approx(liq, abs=1e-6) == 90.5
+        expected = 100.0 * (1.0 - 1.0 / 10.0) / (1.0 - 0.005)
+        assert pytest.approx(liq, abs=1e-6) == expected
 
     def test_liquidation_price_short(self):
         """Correct liquidation price for a short position.
 
-        Formula: liq = entry * (1 + 1/leverage - maint_margin_pct)
-        entry=100, leverage=10, maint=0.005 => liq = 100*(1 + 0.1 - 0.005) = 109.5
+        HL formula: liq = entry * (1 + 1/lev) / (1 + mm)
+        entry=100, leverage=10, maint=0.005
+        => liq = 100 * 1.1 / 1.005 = 109.45274...
         """
         liq = compute_liquidation_price(
             entry=100.0, leverage=10.0, is_long=False, maint_margin_pct=0.005
         )
-        assert pytest.approx(liq, abs=1e-6) == 109.5
+        expected = 100.0 * (1.0 + 1.0 / 10.0) / (1.0 + 0.005)
+        assert pytest.approx(liq, abs=1e-6) == expected
 
 
 class TestValidateStopVsLiquidation:
     def test_validate_stop_vs_liquidation_valid(self):
         """A stop well above liquidation price should pass for longs."""
-        # entry=100, leverage=5, is_long=True
-        # liq = 100*(1 - 0.2 + 0.005) = 80.5
-        # threshold = 80.5 * 1.25 = 100.625
-        # stop=95 is below threshold (95 < 100.625) => should FAIL
-        # So pick a stop that actually passes: need stop >= 100.625
-        # Actually let's use lower leverage or higher stop.
         # entry=100, leverage=3, is_long=True
-        # liq = 100*(1 - 1/3 + 0.005) = 100*0.6717 = 67.17
-        # threshold = 67.17 * 1.25 = 83.96
-        # stop=95 >= 83.96 => should PASS
+        # liq = 100*(1 - 1/3) / (1 - 0.005) = 100*0.6667/0.995 = 66.99
+        # threshold = 66.99 * 1.25 = 83.74
+        # stop=95 >= 83.74 => should PASS
         valid, msg = validate_stop_vs_liquidation(
             entry=100.0,
             stop=95.0,
@@ -126,9 +124,9 @@ class TestValidateStopVsLiquidation:
     def test_validate_stop_vs_liquidation_invalid(self):
         """A stop too close to liquidation should fail."""
         # entry=100, leverage=5, is_long=True
-        # liq = 100*(1 - 0.2 + 0.005) = 80.5
-        # threshold = 80.5 * 1.25 = 100.625
-        # stop=82 < 100.625 => FAIL
+        # liq = 100*(1 - 0.2) / (1 - 0.005) = 80.40
+        # threshold = 80.40 * 1.25 = 100.50
+        # stop=82 < 100.50 => FAIL
         valid, msg = validate_stop_vs_liquidation(
             entry=100.0,
             stop=82.0,

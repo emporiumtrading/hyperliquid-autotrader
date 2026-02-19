@@ -131,7 +131,10 @@ def bb_width(close: pd.Series, period: int = 20, num_std: float = 2.0) -> pd.Ser
     width = (upper - lower) / middle
     """
     upper, middle, lower = bollinger_bands(close, period, num_std)
-    return (upper - lower) / middle
+    width = (upper - lower) / middle
+    # Sanitize inf values that arise when middle band is zero
+    width = width.replace([np.inf, -np.inf], np.nan)
+    return width
 
 
 def bb_width_percentile(

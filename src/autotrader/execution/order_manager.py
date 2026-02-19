@@ -8,6 +8,7 @@ and historical order state.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from enum import Enum
 
@@ -128,6 +129,7 @@ class OrderManager:
         self.broker = broker
         self.orders: dict[str, ManagedOrder] = {}
         self.trade_orders: dict[str, list[str]] = {}  # trade_id -> [order_ids]
+        self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Entry orders

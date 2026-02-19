@@ -7,6 +7,7 @@ and dispatches to the appropriate trading mode (paper, canary, or live).
 from __future__ import annotations
 
 import argparse
+import signal
 import sys
 
 from autotrader.governance.registry import BaselineRegistry
@@ -77,16 +78,6 @@ def main() -> int:
     # Determine effective environment
     env = cfg.get("env", args.env)
 
-    if env in ("paper", "canary"):
-        logger.info("starting_trader", env=env)
-        scheduler = TradingScheduler(cfg)
-        try:
-            scheduler.run_loop(max_iterations=args.max_iterations)
-        except KeyboardInterrupt:
-            logger.info("shutdown_requested")
-            scheduler.shutdown()
-        return 0
-
     if env == "live":
         # Live mode requires an approved baseline
         registry = BaselineRegistry()
@@ -101,13 +92,28 @@ def main() -> int:
             "starting_live_trader",
             baseline_version=baseline.get("version"),
         )
-        scheduler = TradingScheduler(cfg)
-        try:
-            scheduler.run_loop(max_iterations=args.max_iterations)
-        except KeyboardInterrupt:
-            logger.info("shutdown_requested")
-            scheduler.shutdown()
-        return 0
+    elif env in ("paper", "canary"):
+        logger.info("starting_trader", env=env)
+    else:
+        logger.error("unknown_env", env=env)
+        return 1
+
+    scheduler = TradingScheduler(cfg)
+
+    # Register SIGTERM handler so containers / systemd can shut down
+    # gracefully instead of getting an unhandled signal.
+    def _sigterm_handler(signum: int, frame: object) -> None:
+        logger.info("sigterm_received", signal=signum)
+        scheduler.shutdown()
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
+    try:
+        scheduler.run_loop(max_iterations=args.max_iterations)
+    except KeyboardInterrupt:
+        logger.info("shutdown_requested")
+        scheduler.shutdown()
+    return 0
 
     logger.error("unknown_env", env=env)
     return 1

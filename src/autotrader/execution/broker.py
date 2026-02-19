@@ -10,6 +10,8 @@ Hyperliquid exchange.
 
 from __future__ import annotations
 
+import hashlib
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -82,6 +84,9 @@ class Broker:
         # Asset symbol -> integer index mapping (populated lazily in live mode)
         self._asset_index: dict[str, int] = {}
 
+        # Thread safety for mutable bookkeeping state
+        self._lock = threading.Lock()
+
         logger.info("broker_init", mode=self.mode)
 
     # ------------------------------------------------------------------
@@ -110,7 +115,9 @@ class Broker:
                 logger.warning("asset_index_fetch_failed", symbol=symbol)
 
         # Fallback: deterministic hash for paper mode or if lookup failed
-        index = abs(hash(symbol)) % 10000
+        # Use SHA-256 instead of hash() which is randomized per-process
+        digest = hashlib.sha256(symbol.encode()).hexdigest()
+        index = int(digest[:8], 16) % 10000
         self._asset_index[symbol] = index
         return index
 
@@ -211,8 +218,8 @@ class Broker:
         else:
             fill_px = price - slippage_per_unit
 
-        # Simulate a fixed taker fee of 3.5 bps
-        fee = notional * 3.5 / 10_000.0
+        # Simulate taker fee of 2.5 bps (matches Hyperliquid standard rate)
+        fee = notional * 2.5 / 10_000.0
 
         # Record fill
         fill_record: dict[str, Any] = {
@@ -697,6 +704,120 @@ class Broker:
         )
 
         return result
+
+    # ------------------------------------------------------------------
+    # Paper-mode trigger evaluation
+    # ------------------------------------------------------------------
+
+    def check_triggers(self, symbol: str, current_price: float) -> list[OrderResult]:
+        """Evaluate pending trigger orders against the current price.
+
+        In paper mode, this simulates stop-loss and take-profit execution.
+        Should be called on each price update during paper trading.
+
+        Parameters
+        ----------
+        symbol:
+            The asset symbol whose price has updated.
+        current_price:
+            The current mark/last price for the symbol.
+
+        Returns
+        -------
+        list[OrderResult]
+            List of fills for any triggered orders.
+        """
+        if self.mode != "paper":
+            return []
+
+        triggered: list[OrderResult] = []
+        to_remove: list[str] = []
+
+        with self._lock:
+            for oid, order in self._pending_orders.items():
+                if not order.get("is_trigger"):
+                    continue
+                if order.get("symbol") != symbol:
+                    continue
+
+                trigger_px = order.get("trigger_px", 0.0)
+                order_type = order.get("order_type", "")
+                side = order.get("side", "")
+
+                hit = False
+                if order_type == "stop_loss":
+                    # Stop-loss sell triggers when price falls to/below trigger
+                    # Stop-loss buy triggers when price rises to/above trigger
+                    if side == "sell" and current_price <= trigger_px:
+                        hit = True
+                    elif side == "buy" and current_price >= trigger_px:
+                        hit = True
+                elif order_type == "take_profit":
+                    # Take-profit sell triggers when price rises to/above trigger
+                    # Take-profit buy triggers when price falls to/below trigger
+                    if side == "sell" and current_price >= trigger_px:
+                        hit = True
+                    elif side == "buy" and current_price <= trigger_px:
+                        hit = True
+
+                if hit:
+                    to_remove.append(oid)
+
+                    # Simulate the fill at the trigger price with slippage
+                    size = order.get("size", 0.0)
+                    notional = size * trigger_px
+                    slippage_usd = self.slippage_model.estimate(notional)
+                    slippage_per_unit = slippage_usd / size if size > 0 else 0.0
+
+                    if side == "buy":
+                        fill_px = trigger_px + slippage_per_unit
+                    else:
+                        fill_px = trigger_px - slippage_per_unit
+
+                    fee = notional * 2.5 / 10_000.0
+                    ts = now_ms()
+
+                    fill_record: dict[str, Any] = {
+                        "order_id": oid,
+                        "symbol": symbol,
+                        "side": side,
+                        "size": size,
+                        "price": round(fill_px, 6),
+                        "fee": round(fee, 6),
+                        "timestamp_ms": ts,
+                        "order_type": order_type,
+                        "reduce_only": True,
+                    }
+                    self.paper_fills.append(fill_record)
+                    self._filled_orders[oid] = fill_record
+
+                    result = OrderResult(
+                        order_id=oid,
+                        status="filled",
+                        filled_px=round(fill_px, 6),
+                        filled_sz=size,
+                        remaining_sz=0.0,
+                        fee=round(fee, 6),
+                        timestamp_ms=ts,
+                    )
+                    triggered.append(result)
+
+                    metrics.inc_counter("trigger_orders_filled_total")
+                    logger.info(
+                        "paper_trigger_filled",
+                        order_id=oid,
+                        symbol=symbol,
+                        side=side,
+                        order_type=order_type,
+                        trigger_px=trigger_px,
+                        fill_px=round(fill_px, 6),
+                    )
+
+            # Remove triggered orders from pending
+            for oid in to_remove:
+                self._pending_orders.pop(oid, None)
+
+        return triggered
 
     # ------------------------------------------------------------------
     # Fill & order queries

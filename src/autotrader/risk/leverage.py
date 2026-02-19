@@ -15,6 +15,42 @@ logger = structlog.get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Dynamic maintenance margin (Hyperliquid tiered schedule)
+# ---------------------------------------------------------------------------
+# Each tier: (max_notional_usd, maint_margin_pct)
+# Source: Hyperliquid documentation -- maintenance margin tiers.
+_MM_TIERS: list[tuple[float, float]] = [
+    (100_000, 0.005),       # <= $100k: 0.5%
+    (500_000, 0.01),        # <= $500k: 1.0%
+    (1_000_000, 0.02),      # <= $1M:   2.0%
+    (5_000_000, 0.03),      # <= $5M:   3.0%
+    (float("inf"), 0.05),   # > $5M:    5.0%
+]
+
+
+def dynamic_maint_margin(notional_usd: float) -> float:
+    """Look up the maintenance margin rate for a position size.
+
+    Uses Hyperliquid's tiered maintenance margin schedule.
+
+    Parameters
+    ----------
+    notional_usd:
+        Absolute position notional value in USD.
+
+    Returns
+    -------
+    float
+        Maintenance margin fraction (e.g. 0.005 for 0.5%).
+    """
+    abs_notional = abs(notional_usd)
+    for max_notional, mm_pct in _MM_TIERS:
+        if abs_notional <= max_notional:
+            return mm_pct
+    return _MM_TIERS[-1][1]
+
+
+# ---------------------------------------------------------------------------
 # Leverage selection
 # ---------------------------------------------------------------------------
 
@@ -104,7 +140,8 @@ def compute_liquidation_price(
     entry: float,
     leverage: float,
     is_long: bool,
-    maint_margin_pct: float = 0.005,
+    maint_margin_pct: float | None = None,
+    notional_usd: float | None = None,
 ) -> float:
     """Estimate the liquidation price for a position.
 
@@ -127,11 +164,27 @@ def compute_liquidation_price(
     if leverage <= 0:
         leverage = 1.0
 
+    # Resolve maintenance margin: use dynamic schedule if not explicitly given
+    if maint_margin_pct is None:
+        if notional_usd is not None:
+            maint_margin_pct = dynamic_maint_margin(notional_usd)
+        else:
+            maint_margin_pct = dynamic_maint_margin(entry * leverage)
+
+    # HL liquidation derivation:
+    #   Long: (liq - entry)*size + initial_margin - liq*size*mm = 0
+    #         liq*(1 - mm) = entry*(1 - 1/lev)  =>  liq = entry*(1 - 1/lev)/(1 - mm)
+    #   Short: (entry - liq)*size + initial_margin - liq*size*mm = 0
+    #          liq*(1 + mm) = entry*(1 + 1/lev)  =>  liq = entry*(1 + 1/lev)/(1 + mm)
     if is_long:
-        liq = entry * (1.0 - 1.0 / leverage + maint_margin_pct)
+        denom = 1.0 - maint_margin_pct
+        if denom <= 0:
+            return 0.0
+        liq = entry * (1.0 - 1.0 / leverage) / denom
         return max(0.0, liq)
     else:
-        liq = entry * (1.0 + 1.0 / leverage - maint_margin_pct)
+        denom = 1.0 + maint_margin_pct
+        liq = entry * (1.0 + 1.0 / leverage) / denom
         return liq
 
 

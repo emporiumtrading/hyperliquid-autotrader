@@ -9,6 +9,7 @@ maintaining rolling daily/weekly PnL accumulators.
 from __future__ import annotations
 
 import math
+import threading
 from typing import Any
 
 import structlog
@@ -53,6 +54,9 @@ class Reconciler:
         # Set of fill keys already processed to avoid double-counting.
         self._processed_fills: set[str] = set()
 
+        # Thread safety for mutable PnL state
+        self._lock = threading.Lock()
+
     # ------------------------------------------------------------------
     # Fill processing
     # ------------------------------------------------------------------
@@ -73,6 +77,11 @@ class Reconciler:
             Summary with keys: ``symbol``, ``side``, ``size``, ``price``,
             ``pnl``, ``fee``, ``is_close``.
         """
+        with self._lock:
+            return self._process_fill_unlocked(fill)
+
+    def _process_fill_unlocked(self, fill: dict[str, Any]) -> dict[str, Any]:
+        """Inner fill processor (caller must hold ``_lock``)."""
         ts = now_ms()
         self._maybe_reset_pnl_windows(ts)
 

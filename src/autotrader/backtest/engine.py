@@ -609,6 +609,8 @@ class BacktestEngine:
         exit_fee = self.cost_model.compute_exit_cost(exit_notional, is_maker=False)
 
         # Funding cost for the holding period
+        # Longs pay positive funding, shorts receive (negative notional).
+        # CostModel preserves sign: positive = cost, negative = rebate.
         hours_held = trade.holding_bars * self._bar_hours
         funding_sign = 1.0 if is_long else -1.0
         funding = self.cost_model.compute_funding_cost(
@@ -618,7 +620,9 @@ class BacktestEngine:
         )
 
         trade.fees += exit_fee
-        trade.funding = abs(funding)  # Store as positive cost
+        # Preserve sign: positive = cost, negative = rebate (shorts earn
+        # funding when rate is positive).
+        trade.funding = funding
         trade.pnl = raw_pnl
         # Net PnL is raw_pnl minus all costs -- but we store raw in .pnl
         # and attribute costs separately so metrics can distinguish.

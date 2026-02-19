@@ -297,7 +297,39 @@ class TradingScheduler:
             except Exception:
                 logger.error("scheduler.cancel_all_on_kill_failed")
 
-        # 6. Drift detection
+        # 6. Probation evaluation (canary mode)
+        if self.probation is not None:
+            try:
+                if not self.probation.is_active():
+                    # Probation window has elapsed -- evaluate and decide
+                    evaluation = self.probation.evaluate()
+                    summary["probation"] = evaluation
+                    if evaluation.get("can_promote"):
+                        logger.info(
+                            "scheduler.probation.graduated",
+                            trades=evaluation.get("trades_count"),
+                            pnl=evaluation.get("pnl"),
+                        )
+                        # Promote: switch from canary to live
+                        self.env = "live"
+                        self.probation = None
+                    else:
+                        logger.warning(
+                            "scheduler.probation.failed",
+                            reasons=evaluation.get("reasons"),
+                        )
+                        # Rollback: trigger kill switch to halt trading
+                        self.kill_switch.trigger(
+                            reason=f"Probation failed: {evaluation.get('reasons')}"
+                        )
+                        summary["kill_triggered"] = True
+                else:
+                    # Feed daily PnL into probation tracker
+                    self.probation.add_daily_pnl(self.reconciler.get_daily_pnl())
+            except Exception as exc:
+                logger.error("scheduler.probation_eval_failed", error=str(exc))
+
+        # 7. Drift detection
         try:
             drift_result = self.drift_detector.check_drift()
             summary["drift"] = drift_result
@@ -310,7 +342,7 @@ class TradingScheduler:
         except Exception as exc:
             logger.error("scheduler.drift_check_failed", error=str(exc))
 
-        # 7. Update metrics
+        # 8. Update metrics
         metrics.set_gauge("equity_usd", self._equity)
         metrics.set_gauge("peak_equity_usd", self._peak_equity)
         metrics.set_gauge("open_positions_count", float(self.exposure_tracker.position_count()))
