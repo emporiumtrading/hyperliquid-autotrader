@@ -1,13 +1,13 @@
 """REST client for Hyperliquid ``/info`` and ``/exchange`` endpoints.
 
-Handles rate limiting, automatic retries with exponential backoff, and
-structured logging via *structlog*.
+Handles rate limiting, automatic retries with exponential backoff, EIP-712
+signing for exchange actions, and structured logging via *structlog*.
 
 Usage
 -----
     from autotrader.hl.client import HLClient, create_client
 
-    client = HLClient(account_address="0x...")
+    client = HLClient(account_address="0x...", api_wallet_key="0x...")
     meta = client.get_meta()
     book = client.get_l2_book("ETH")
 """
@@ -21,6 +21,7 @@ import requests
 import structlog
 
 from autotrader.hl.rate_limiter import acquire
+from autotrader.hl.signing import sign_l1_action
 
 logger = structlog.get_logger(__name__)
 
@@ -41,9 +42,11 @@ class HLClient:
         The user's Ethereum-style address used as the default ``user``
         parameter in info queries.
     api_wallet_key : str
-        Hex-encoded private key of the API wallet.  Used when signing
-        ``/exchange`` payloads (signing itself is not yet implemented --
-        the key is stored for future use).
+        Hex-encoded private key of the API wallet.  Used to sign
+        ``/exchange`` payloads via EIP-712.
+    vault_address : str
+        Optional vault address.  If non-empty, exchange payloads will
+        include ``vaultAddress``.
     """
 
     def __init__(
@@ -51,10 +54,13 @@ class HLClient:
         rest_url: str = "https://api.hyperliquid.xyz",
         account_address: str = "",
         api_wallet_key: str = "",
+        vault_address: str = "",
     ) -> None:
         self.rest_url = rest_url.rstrip("/")
         self.account_address = account_address
         self.api_wallet_key = api_wallet_key
+        self.vault_address = vault_address
+        self._is_mainnet: bool = "testnet" not in rest_url
         self._session = requests.Session()
         self._session.headers.update({"Content-Type": "application/json"})
 
@@ -117,23 +123,54 @@ class HLClient:
         raise last_exc  # type: ignore[misc]
 
     def _post_exchange(self, payload: dict) -> Any:
-        """POST to ``/exchange``.
+        """POST to ``/exchange`` with EIP-712 signature attached.
 
-        Signing is not yet implemented -- the payload is sent as-is.
-        In production this method would attach an EIP-712 signature
-        generated from ``self.api_wallet_key``.
+        The method takes a payload that *must* contain ``action`` and
+        ``nonce`` keys.  It signs the action using the configured
+        ``api_wallet_key`` and attaches ``signature`` (and optionally
+        ``vaultAddress``) before sending.
 
         Parameters
         ----------
         payload : dict
-            JSON body to send (must already contain ``action``, ``nonce``,
-            ``signature``, and ``vaultAddress`` if applicable).
+            Must contain ``action`` (dict) and ``nonce`` (int).
 
         Returns
         -------
         dict
             Decoded JSON response.
+
+        Raises
+        ------
+        ValueError
+            If ``api_wallet_key`` is empty (cannot sign).
         """
+        if not self.api_wallet_key:
+            raise ValueError(
+                "Cannot send exchange request: api_wallet_key is not configured"
+            )
+
+        action = payload.get("action", {})
+        nonce = payload.get("nonce", 0)
+
+        # Sign the action
+        signature = sign_l1_action(
+            wallet_key=self.api_wallet_key,
+            action=action,
+            nonce=nonce,
+            vault_address=self.vault_address or None,
+            is_mainnet=self._is_mainnet,
+        )
+
+        # Build the signed request body
+        signed_payload: dict[str, Any] = {
+            "action": action,
+            "nonce": nonce,
+            "signature": signature,
+        }
+        if self.vault_address:
+            signed_payload["vaultAddress"] = self.vault_address
+
         url = f"{self.rest_url}/exchange"
         last_exc: Exception | None = None
 
@@ -141,7 +178,7 @@ class HLClient:
             acquire(weight=1.0)
 
             try:
-                resp = self._session.post(url, json=payload, timeout=10)
+                resp = self._session.post(url, json=signed_payload, timeout=10)
                 resp.raise_for_status()
                 return resp.json()
             except (
@@ -337,9 +374,11 @@ def create_client(config: dict) -> HLClient:
     * ``rest_url`` -- Base REST URL.
     * ``account_address`` -- User Ethereum address.
     * ``api_wallet_key`` -- API wallet private key.
+    * ``vault_address`` -- Optional vault address for vault-mode trading.
     """
     return HLClient(
         rest_url=config.get("rest_url", "https://api.hyperliquid.xyz"),
         account_address=config.get("account_address", ""),
         api_wallet_key=config.get("api_wallet_key", ""),
+        vault_address=config.get("vault_address", ""),
     )

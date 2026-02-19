@@ -115,9 +115,6 @@ def main() -> int:
         scheduler.shutdown()
     return 0
 
-    logger.error("unknown_env", env=env)
-    return 1
-
 
 if __name__ == "__main__":
     sys.exit(main())

@@ -127,6 +127,55 @@ class ExposureTracker:
         with self._lock:
             return self.positions.get(symbol)
 
+    # -- correlation-based exposure limits ------------------------------------
+
+    def same_direction_count(self, side: str) -> int:
+        """Count positions with the same direction."""
+        with self._lock:
+            return sum(1 for p in self.positions.values() if p.side == side)
+
+    def same_direction_notional(self, side: str) -> float:
+        """Total notional of positions in the same direction."""
+        with self._lock:
+            return sum(
+                abs(p.size * p.current_px)
+                for p in self.positions.values()
+                if p.side == side
+            )
+
+    def max_correlated_cluster_exposure(
+        self, max_cluster_pct: float = 0.6
+    ) -> tuple[bool, float]:
+        """Check if the dominant direction exceeds *max_cluster_pct* of gross.
+
+        Correlated positions (all longs or all shorts) shouldn't dominate
+        the book.  This is a heuristic: if > 60% of gross exposure is in
+        one direction, we consider the portfolio excessively correlated.
+
+        Returns
+        -------
+        tuple[bool, float]
+            ``(is_exceeded, dominant_pct)``
+        """
+        with self._lock:
+            long_notional = sum(
+                abs(p.size * p.current_px)
+                for p in self.positions.values()
+                if p.side == "long"
+            )
+            short_notional = sum(
+                abs(p.size * p.current_px)
+                for p in self.positions.values()
+                if p.side == "short"
+            )
+
+        gross = long_notional + short_notional
+        if gross <= 0:
+            return False, 0.0
+
+        dominant_pct = max(long_notional, short_notional) / gross
+        return dominant_pct > max_cluster_pct, dominant_pct
+
     # -- bridge to RiskState ------------------------------------------------
 
     def to_risk_state(

@@ -3,10 +3,20 @@
 Orchestrates data collection, feature computation, regime classification,
 strategy signal generation, risk approval, order execution, reconciliation,
 drift detection, and kill switch monitoring in a single polling loop.
+
+Implements:
+- Multi-timeframe analysis (regime on 1h/4h, signals on 15m, execution on 1m)
+- Spread/depth-based universe filtering
+- No-trade windows (stale data, extreme vol, degraded rate limits)
+- Automated drift response (reduce exposure, halt on critical)
+- Order chase / re-pricing logic for unfilled limit orders
+- Lot size / tick size rounding from exchange metadata
+- Latency metrics for the trading loop
 """
 
 from __future__ import annotations
 
+import math
 import time
 from typing import Any
 
@@ -17,6 +27,7 @@ from autotrader.data.collectors.candles import stream_candles_to_store
 from autotrader.data.collectors.funding_oi import fetch_asset_contexts
 from autotrader.data.collectors.l2book import snapshot_l2
 from autotrader.data.collectors.user_state import fetch_user_state
+from autotrader.data.transforms.resample import resample_ohlcv
 from autotrader.execution.broker import Broker
 from autotrader.execution.order_manager import OrderManager
 from autotrader.execution.reconciliation import Reconciler
@@ -55,6 +66,7 @@ from autotrader.governance.drift import DriftDetector
 from autotrader.governance.probation import ProbationEvaluator
 from autotrader.governance.registry import BaselineRegistry
 from autotrader.hl.client import HLClient, create_client
+from autotrader.hl.rate_limiter import available as rate_limit_available
 from autotrader.hl.types import Signal
 from autotrader.monitoring.metrics import metrics
 from autotrader.regimes.classifier import RegimeClassifier
@@ -78,6 +90,10 @@ logger = structlog.get_logger(__name__)
 # Map strategy signal sides to the canonical buy/sell used by the approval
 # and execution layers.
 _SIDE_TO_APPROVAL = {"long": "buy", "short": "sell", "buy": "buy", "sell": "sell"}
+
+# Default multi-TF roles
+_DEFAULT_REGIME_TIMEFRAMES = ["1h"]
+_DEFAULT_SIGNAL_TIMEFRAME = "15m"
 
 
 class TradingScheduler:
@@ -134,6 +150,11 @@ class TradingScheduler:
             order_manager=self.order_manager,
         )
 
+        # ---- Order chase config ----
+        self._chase_timeout_sec: float = float(exec_cfg.get("chase_timeout_sec", 8.0))
+        self._chase_max_retries: int = int(exec_cfg.get("chase_max_retries", 3))
+        self._max_slippage_bps: float = float(exec_cfg.get("max_slippage_bps", 5.0))
+
         # ---- Governance ----
         drift_cfg = config.get("drift", None)
         self.drift_detector: DriftDetector = DriftDetector(config=drift_cfg)
@@ -151,29 +172,70 @@ class TradingScheduler:
             self.probation = ProbationEvaluator(config=probation_cfg)
             self.probation.start()
 
-        # ---- Timeframes / universe ----
-        timeframes_raw = config.get("timeframes", ["15m"])
-        if isinstance(timeframes_raw, str):
-            self.timeframes: list[str] = [timeframes_raw]
+        # ---- Multi-timeframe config ----
+        tf_cfg = config.get("timeframes", {})
+        if isinstance(tf_cfg, dict):
+            self._regime_timeframes: list[str] = list(
+                tf_cfg.get("regime", _DEFAULT_REGIME_TIMEFRAMES)
+            )
+            self._signal_timeframe: str = tf_cfg.get("signal", _DEFAULT_SIGNAL_TIMEFRAME)
+            self._execution_timeframe: str = tf_cfg.get("execution", "1m")
+        elif isinstance(tf_cfg, list):
+            # Legacy: first item is signal TF
+            self._regime_timeframes = _DEFAULT_REGIME_TIMEFRAMES
+            self._signal_timeframe = tf_cfg[0] if tf_cfg else _DEFAULT_SIGNAL_TIMEFRAME
+            self._execution_timeframe = "1m"
         else:
-            self.timeframes = list(timeframes_raw)
-        self.primary_timeframe: str = self.timeframes[0]
+            self._regime_timeframes = _DEFAULT_REGIME_TIMEFRAMES
+            self._signal_timeframe = str(tf_cfg) if tf_cfg else _DEFAULT_SIGNAL_TIMEFRAME
+            self._execution_timeframe = "1m"
 
+        # Collect all unique timeframes we need to fetch
+        self._all_timeframes: list[str] = list(
+            dict.fromkeys(
+                [self._signal_timeframe] + self._regime_timeframes + [self._execution_timeframe]
+            )
+        )
+        self.primary_timeframe: str = self._signal_timeframe
+
+        # ---- Universe config ----
         universe_cfg = config.get("universe", {})
         if isinstance(universe_cfg, list):
             self._static_universe: list[str] = list(universe_cfg)
             self._top_n: int = len(universe_cfg)
             self._min_volume: float = 0.0
+            self._max_spread_bps: float = 999.0
+            self._min_depth_usd: float = 0.0
         elif isinstance(universe_cfg, dict):
             self._static_universe = list(universe_cfg.get("symbols", []))
             self._top_n = int(universe_cfg.get("top_n", 20))
             self._min_volume = float(universe_cfg.get("min_volume", 0.0))
+            self._max_spread_bps = float(universe_cfg.get("max_spread_bps", 3.0))
+            self._min_depth_usd = float(universe_cfg.get("min_depth_usd", 200_000.0))
         else:
             self._static_universe = []
             self._top_n = 20
             self._min_volume = 0.0
+            self._max_spread_bps = 3.0
+            self._min_depth_usd = 200_000.0
 
         self.universe: list[str] = []
+
+        # ---- No-trade window config ----
+        ntw_cfg = config.get("no_trade_windows", {})
+        self._max_data_age_ms: int = int(
+            ntw_cfg.get("max_data_age_ms", 5 * 60 * 1000)
+        )  # 5 min
+        self._extreme_vol_threshold: float = float(
+            ntw_cfg.get("extreme_vol_threshold", 2.0)
+        )  # 2x normal vol ratio
+        self._min_rate_limit_tokens: float = float(
+            ntw_cfg.get("min_rate_limit_tokens", 100.0)
+        )
+
+        # ---- Asset metadata (sz_decimals, max_leverage) ----
+        self._asset_meta: dict[str, dict] = {}  # symbol -> {sz_decimals, max_leverage}
+        self._meta_loaded: bool = False
 
         # ---- Loop control ----
         self.poll_interval_sec: float = float(
@@ -185,47 +247,99 @@ class TradingScheduler:
         self._equity: float = float(config.get("initial_equity", 10_000.0))
         self._peak_equity: float = self._equity
 
+        # ---- Drift response state ----
+        self._drift_reduced: bool = False
+
         logger.info(
             "scheduler.init",
             env=self.env,
             mode=mode,
-            timeframes=self.timeframes,
+            regime_timeframes=self._regime_timeframes,
+            signal_timeframe=self._signal_timeframe,
+            execution_timeframe=self._execution_timeframe,
             poll_interval_sec=self.poll_interval_sec,
         )
+
+    # ------------------------------------------------------------------
+    # Asset metadata (lot size / tick size)
+    # ------------------------------------------------------------------
+
+    def _load_asset_meta(self) -> None:
+        """Load exchange metadata for sz_decimals and max_leverage."""
+        if self._meta_loaded:
+            return
+        try:
+            meta = self.client.get_meta()
+            universe = meta.get("universe", [])
+            for asset in universe:
+                name = asset.get("name", "")
+                if name:
+                    self._asset_meta[name] = {
+                        "sz_decimals": int(asset.get("szDecimals", 3)),
+                        "max_leverage": int(asset.get("maxLeverage", 50)),
+                    }
+            self._meta_loaded = True
+            logger.info("scheduler.asset_meta_loaded", count=len(self._asset_meta))
+        except Exception as exc:
+            logger.warning("scheduler.asset_meta_load_failed", error=str(exc))
+
+    def _round_size(self, symbol: str, size: float) -> float:
+        """Round order size to the exchange's sz_decimals for the asset."""
+        meta = self._asset_meta.get(symbol, {})
+        sz_decimals = meta.get("sz_decimals", 3)
+        factor = 10**sz_decimals
+        return math.floor(size * factor) / factor
+
+    def _round_price(self, symbol: str, price: float) -> float:
+        """Round price to a reasonable precision (5 significant figures)."""
+        if price <= 0:
+            return 0.0
+        # Hyperliquid uses 5 significant figures for prices
+        magnitude = math.floor(math.log10(abs(price)))
+        decimals = max(0, 4 - magnitude)
+        factor = 10**decimals
+        return round(price * factor) / factor
+
+    # ------------------------------------------------------------------
+    # No-trade window checks
+    # ------------------------------------------------------------------
+
+    def _check_no_trade_window(
+        self, symbol: str, candles: pd.DataFrame, features: dict
+    ) -> str | None:
+        """Check if a no-trade window is active for this symbol.
+
+        Returns a reason string if trading should be skipped, or None.
+        """
+        # 1. Stale data check
+        if not candles.empty and "timestamp_ms" in candles.columns:
+            last_ts = int(candles["timestamp_ms"].iloc[-1])
+            age_ms = now_ms() - last_ts
+            if age_ms > self._max_data_age_ms:
+                return f"stale_data: last candle {age_ms / 1000:.0f}s old"
+
+        # 2. Extreme volatility check
+        vol_ratio = features.get("vol_ratio")
+        if vol_ratio is not None and vol_ratio > self._extreme_vol_threshold:
+            return f"extreme_vol: vol_ratio={vol_ratio:.2f} > {self._extreme_vol_threshold}"
+
+        # 3. Rate limit degradation
+        try:
+            tokens = rate_limit_available()
+            if tokens < self._min_rate_limit_tokens:
+                return f"rate_limit_low: {tokens:.0f} tokens remaining"
+        except Exception:
+            pass
+
+        return None
 
     # ------------------------------------------------------------------
     # Single iteration
     # ------------------------------------------------------------------
 
     def run_once(self) -> dict:
-        """Execute a single iteration of the trading loop.
-
-        Steps
-        -----
-        1. Check kill switch -- abort if triggered.
-        2. Refresh the trading universe.
-        3. For each symbol in the universe:
-           a. Fetch / update candles.
-           b. Fetch L2 book snapshot.
-           c. Compute features from candle data.
-           d. Classify regime with hysteresis.
-           e. Build ``MarketContext``.
-           f. Generate strategy signal.
-           g. If signal is actionable, run risk approval.
-           h. If approved, submit order via the order manager.
-        4. Reconcile fills.
-        5. Check kill switch auto-trigger conditions.
-        6. Check for performance drift.
-        7. Update metrics gauges.
-        8. Return a summary dict.
-
-        Returns
-        -------
-        dict
-            Summary of the iteration with keys: ``timestamp_ms``,
-            ``universe``, ``signals``, ``orders``, ``kills_triggered``,
-            ``drift``.
-        """
+        """Execute a single iteration of the trading loop."""
+        loop_start = time.monotonic()
         ts = now_ms()
         summary: dict[str, Any] = {
             "timestamp_ms": ts,
@@ -234,6 +348,7 @@ class TradingScheduler:
             "orders": [],
             "kill_triggered": False,
             "drift": {},
+            "no_trade_windows": [],
         }
 
         # 1. Kill switch check
@@ -245,12 +360,14 @@ class TradingScheduler:
             summary["kill_triggered"] = True
             return summary
 
-        # 2. Refresh universe
+        # Load asset metadata once
+        self._load_asset_meta()
+
+        # 2. Refresh universe (with spread/depth filters)
         try:
             self.universe = self._refresh_universe()
         except Exception as exc:
             logger.error("scheduler.universe_refresh_failed", error=str(exc))
-            # Fall back to previous universe if available
             if not self.universe:
                 return summary
 
@@ -259,10 +376,21 @@ class TradingScheduler:
         # Refresh equity from user state (best-effort)
         self._update_equity()
 
+        # Cache asset contexts for the iteration (avoid re-fetching per symbol)
+        cached_ctx_df: pd.DataFrame | None = None
+        try:
+            cached_ctx_df = fetch_asset_contexts(self.client)
+        except Exception:
+            pass
+
         # 3. Process each symbol
         for symbol in self.universe:
             try:
-                result = self._process_symbol(symbol)
+                result = self._process_symbol(symbol, cached_ctx_df)
+                if result.get("no_trade_reason"):
+                    summary["no_trade_windows"].append(
+                        {"symbol": symbol, "reason": result["no_trade_reason"]}
+                    )
                 if result.get("signal_side") and result["signal_side"] != "flat":
                     summary["signals"].append(result)
                 if result.get("order_id"):
@@ -281,7 +409,13 @@ class TradingScheduler:
         except Exception as exc:
             logger.error("scheduler.reconcile_failed", error=str(exc))
 
-        # 5. Kill switch auto-check
+        # 5. Chase unfilled orders
+        try:
+            self._chase_unfilled_orders()
+        except Exception as exc:
+            logger.error("scheduler.chase_failed", error=str(exc))
+
+        # 6. Kill switch auto-check
         risk_state = self._build_risk_state()
         kill_triggered = self.kill_switch.check_conditions(risk_state, self.risk_config)
         summary["kill_triggered"] = kill_triggered
@@ -291,17 +425,15 @@ class TradingScheduler:
                 "scheduler.kill_switch_auto_triggered",
                 reason=self.kill_switch.trigger_reason(),
             )
-            # Cancel all orders on kill switch
             try:
                 self.broker.cancel_all()
             except Exception:
                 logger.error("scheduler.cancel_all_on_kill_failed")
 
-        # 6. Probation evaluation (canary mode)
+        # 7. Probation evaluation (canary mode)
         if self.probation is not None:
             try:
                 if not self.probation.is_active():
-                    # Probation window has elapsed -- evaluate and decide
                     evaluation = self.probation.evaluate()
                     summary["probation"] = evaluation
                     if evaluation.get("can_promote"):
@@ -310,7 +442,6 @@ class TradingScheduler:
                             trades=evaluation.get("trades_count"),
                             pnl=evaluation.get("pnl"),
                         )
-                        # Promote: switch from canary to live
                         self.env = "live"
                         self.probation = None
                     else:
@@ -318,36 +449,32 @@ class TradingScheduler:
                             "scheduler.probation.failed",
                             reasons=evaluation.get("reasons"),
                         )
-                        # Rollback: trigger kill switch to halt trading
                         self.kill_switch.trigger(
                             reason=f"Probation failed: {evaluation.get('reasons')}"
                         )
                         summary["kill_triggered"] = True
                 else:
-                    # Feed daily PnL into probation tracker
                     self.probation.add_daily_pnl(self.reconciler.get_daily_pnl())
             except Exception as exc:
                 logger.error("scheduler.probation_eval_failed", error=str(exc))
 
-        # 7. Drift detection
+        # 8. Drift detection + automated response
         try:
             drift_result = self.drift_detector.check_drift()
             summary["drift"] = drift_result
             if drift_result.get("drifting"):
-                logger.warning(
-                    "scheduler.drift_detected",
-                    severity=drift_result.get("severity"),
-                    signals=drift_result.get("signals"),
-                )
+                self._handle_drift(drift_result)
         except Exception as exc:
             logger.error("scheduler.drift_check_failed", error=str(exc))
 
-        # 8. Update metrics
+        # 9. Update metrics
+        loop_elapsed_ms = (time.monotonic() - loop_start) * 1000
         metrics.set_gauge("equity_usd", self._equity)
         metrics.set_gauge("peak_equity_usd", self._peak_equity)
         metrics.set_gauge("open_positions_count", float(self.exposure_tracker.position_count()))
         metrics.set_gauge("total_notional_usd", self.exposure_tracker.total_notional())
         metrics.set_gauge("universe_size", float(len(self.universe)))
+        metrics.observe("loop_latency_ms", loop_elapsed_ms)
         metrics.inc_counter("scheduler_iterations_total")
 
         logger.info(
@@ -356,6 +483,7 @@ class TradingScheduler:
             signals=len(summary["signals"]),
             orders=len(summary["orders"]),
             equity=round(self._equity, 2),
+            loop_ms=round(loop_elapsed_ms, 1),
         )
 
         return summary
@@ -365,22 +493,7 @@ class TradingScheduler:
     # ------------------------------------------------------------------
 
     def run_loop(self, max_iterations: int | None = None) -> None:
-        """Run the trading loop continuously.
-
-        The loop executes :meth:`run_once` on each iteration, sleeps for
-        ``poll_interval_sec``, and repeats until the kill switch is
-        triggered, :meth:`shutdown` is called, or *max_iterations* is
-        reached.
-
-        Individual iteration failures are caught and logged so that a
-        single bad tick does not crash the entire process.
-
-        Parameters
-        ----------
-        max_iterations : int | None
-            If set, exit the loop after this many iterations (useful for
-            testing).  ``None`` means run indefinitely.
-        """
+        """Run the trading loop continuously."""
         self.running = True
         iteration = 0
 
@@ -392,7 +505,6 @@ class TradingScheduler:
 
         try:
             while self.running:
-                # Check termination conditions before executing
                 if self.kill_switch.is_triggered():
                     logger.warning(
                         "scheduler.loop.kill_switch_halt",
@@ -407,11 +519,8 @@ class TradingScheduler:
                     )
                     break
 
-                # Execute one iteration
                 try:
                     summary = self.run_once()
-
-                    # If the kill switch was triggered during this iteration, stop
                     if summary.get("kill_triggered"):
                         logger.warning("scheduler.loop.kill_during_iteration")
                         break
@@ -426,8 +535,6 @@ class TradingScheduler:
 
                 iteration += 1
 
-                # Sleep between iterations (interruptible by setting
-                # self.running = False from another thread)
                 if self.running:
                     time.sleep(self.poll_interval_sec)
 
@@ -439,24 +546,15 @@ class TradingScheduler:
     # ------------------------------------------------------------------
 
     def shutdown(self) -> None:
-        """Gracefully shut down the scheduler.
-
-        Sets ``running`` to ``False``, cancels all open orders, and logs
-        the final state.
-        """
+        """Gracefully shut down the scheduler."""
         self.running = False
-
         logger.info("scheduler.shutdown.start")
 
-        # Cancel all open orders
         try:
             cancelled = self.broker.cancel_all()
             logger.info("scheduler.shutdown.orders_cancelled", count=cancelled)
         except Exception as exc:
-            logger.error(
-                "scheduler.shutdown.cancel_failed",
-                error=str(exc),
-            )
+            logger.error("scheduler.shutdown.cancel_failed", error=str(exc))
 
         logger.info(
             "scheduler.shutdown.complete",
@@ -465,21 +563,13 @@ class TradingScheduler:
         )
 
     # ------------------------------------------------------------------
-    # Universe management
+    # Universe management (with spread / depth filters)
     # ------------------------------------------------------------------
 
     def _refresh_universe(self) -> list[str]:
-        """Fetch asset contexts and select the top-N symbols by liquidity.
+        """Fetch asset contexts and select top-N symbols by liquidity.
 
-        If a static universe is configured (explicit symbol list), it is
-        used directly.  Otherwise, symbols are ranked by ``day_ntl_vlm``
-        and the top *N* that exceed the minimum volume threshold are
-        selected.
-
-        Returns
-        -------
-        list[str]
-            Ordered list of symbols to trade this iteration.
+        Applies volume, spread, and depth filters per PRD section 6.1.
         """
         if self._static_universe:
             return list(self._static_universe)
@@ -494,54 +584,83 @@ class TradingScheduler:
         if self._min_volume > 0:
             ctx_df = ctx_df[ctx_df["day_ntl_vlm"] >= self._min_volume]
 
-        # Sort by daily notional volume descending and pick top N
+        # Sort by daily notional volume descending and pick top N candidates
         ctx_df = ctx_df.sort_values("day_ntl_vlm", ascending=False)
-        symbols = ctx_df["name"].head(self._top_n).tolist()
+        candidates = ctx_df["name"].head(self._top_n * 2).tolist()  # overfetch for filtering
+
+        # Apply spread and depth filters
+        filtered: list[str] = []
+        for symbol in candidates:
+            if len(filtered) >= self._top_n:
+                break
+            try:
+                book = snapshot_l2(self.client, symbol)
+                spread = book.get("spread_bps", 999.0)
+                depth = book.get("bid_depth_usd", 0.0) + book.get("ask_depth_usd", 0.0)
+                if spread > self._max_spread_bps:
+                    logger.debug(
+                        "scheduler.universe.spread_filter",
+                        symbol=symbol,
+                        spread_bps=spread,
+                    )
+                    continue
+                if depth < self._min_depth_usd:
+                    logger.debug(
+                        "scheduler.universe.depth_filter",
+                        symbol=symbol,
+                        depth_usd=depth,
+                    )
+                    continue
+                filtered.append(symbol)
+            except Exception:
+                # If we can't check L2, still include based on volume ranking
+                filtered.append(symbol)
 
         logger.info(
             "scheduler.universe.refreshed",
-            count=len(symbols),
-            top_symbols=symbols[:5],
+            count=len(filtered),
+            top_symbols=filtered[:5],
         )
-        return symbols
+        return filtered
 
     # ------------------------------------------------------------------
     # Per-symbol processing
     # ------------------------------------------------------------------
 
-    def _process_symbol(self, symbol: str) -> dict[str, Any]:
-        """Run the full signal-to-order pipeline for a single symbol.
-
-        Returns a dict summarising what happened (signal, approval,
-        order result).
-        """
+    def _process_symbol(
+        self, symbol: str, cached_ctx_df: pd.DataFrame | None
+    ) -> dict[str, Any]:
+        """Run the full signal-to-order pipeline for a single symbol."""
         result: dict[str, Any] = {
             "symbol": symbol,
             "signal_side": "flat",
             "confidence": 0.0,
             "approved": False,
             "order_id": "",
+            "no_trade_reason": "",
         }
 
-        # a. Fetch / update candles
-        try:
-            stream_candles_to_store(
-                client=self.client,
-                store=self.store,
-                coins=[symbol],
-                interval=self.primary_timeframe,
-            )
-        except Exception as exc:
-            logger.warning(
-                "scheduler.candle_fetch_failed",
-                symbol=symbol,
-                error=str(exc),
-            )
+        # a. Fetch / update candles for all needed timeframes
+        for tf in self._all_timeframes:
+            try:
+                stream_candles_to_store(
+                    client=self.client,
+                    store=self.store,
+                    coins=[symbol],
+                    interval=tf,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "scheduler.candle_fetch_failed",
+                    symbol=symbol,
+                    timeframe=tf,
+                    error=str(exc),
+                )
 
-        # Read candles from store
+        # Read signal-timeframe candles from store
         candles = self.store.read_candles(
             symbol=symbol,
-            timeframe=self.primary_timeframe,
+            timeframe=self._signal_timeframe,
             start_ms=0,
             end_ms=now_ms(),
         )
@@ -565,31 +684,37 @@ class TradingScheduler:
                 error=str(exc),
             )
 
-        # c. Compute features
+        # c. Compute features on signal timeframe
         features = self._compute_features(candles)
 
-        # d. Classify regime + hysteresis
-        raw_regime, raw_confidence = self.regime_classifier.classify(features)
+        # c2. Multi-TF regime features: compute from higher TF candles
+        regime_features = self._compute_regime_features(symbol, features)
+
+        # d. No-trade window check
+        ntw_reason = self._check_no_trade_window(symbol, candles, features)
+        if ntw_reason:
+            result["no_trade_reason"] = ntw_reason
+            logger.info("scheduler.no_trade_window", symbol=symbol, reason=ntw_reason)
+            metrics.inc_counter("no_trade_windows_total")
+            return result
+
+        # e. Classify regime with hysteresis (using higher-TF features)
+        raw_regime, raw_confidence = self.regime_classifier.classify(regime_features)
         effective_regime = self.hysteresis.update(raw_regime, raw_confidence)
         effective_confidence = self.hysteresis.current_confidence
 
-        # e. Build MarketContext
-        # Extract funding rate from the latest asset context if available
+        # f. Build MarketContext
         funding_rate: float | None = None
         open_interest: float | None = None
-        try:
-            ctx_df = fetch_asset_contexts(self.client)
-            if not ctx_df.empty:
-                symbol_ctx = ctx_df[ctx_df["name"] == symbol]
-                if not symbol_ctx.empty:
-                    funding_rate = float(symbol_ctx.iloc[0]["funding"])
-                    open_interest = float(symbol_ctx.iloc[0]["open_interest"])
-        except Exception:
-            pass
+        if cached_ctx_df is not None and not cached_ctx_df.empty:
+            symbol_ctx = cached_ctx_df[cached_ctx_df["name"] == symbol]
+            if not symbol_ctx.empty:
+                funding_rate = float(symbol_ctx.iloc[0]["funding"])
+                open_interest = float(symbol_ctx.iloc[0]["open_interest"])
 
         ctx = MarketContext(
             symbol=symbol,
-            timeframe=self.primary_timeframe,
+            timeframe=self._signal_timeframe,
             candles=candles,
             features=features,
             regime=effective_regime,
@@ -600,7 +725,7 @@ class TradingScheduler:
             account_equity=self._equity,
         )
 
-        # f. Get signal from strategy
+        # g. Get signal from strategy
         try:
             signal = self.strategy.compute_signal(ctx)
         except Exception as exc:
@@ -617,7 +742,7 @@ class TradingScheduler:
         if signal.side == "flat":
             return result
 
-        # g. Risk approval
+        # h. Risk approval
         approval_side = _SIDE_TO_APPROVAL.get(signal.side, signal.side)
         if approval_side not in ("buy", "sell"):
             return result
@@ -654,13 +779,25 @@ class TradingScheduler:
             )
             return result
 
-        # h. Submit order via order manager
+        # i. Apply lot size / tick size rounding
         trade_id = generate_trade_id()
-        size_coins = approval.get("size_coins", 0.0)
-        entry_px = signal.entry if signal.entry is not None else 0.0
-        stop_px = signal.stop
-        tp_px = signal.take_profit
+        raw_size = approval.get("size_coins", 0.0)
+        size_coins = self._round_size(symbol, raw_size)
+        entry_px = self._round_price(
+            symbol, signal.entry if signal.entry is not None else 0.0
+        )
+        stop_px = self._round_price(symbol, signal.stop) if signal.stop else None
+        tp_px = self._round_price(symbol, signal.take_profit) if signal.take_profit else None
 
+        if size_coins <= 0:
+            logger.info(
+                "scheduler.size_rounded_to_zero",
+                symbol=symbol,
+                raw_size=raw_size,
+            )
+            return result
+
+        # j. Submit order via order manager
         try:
             managed_order = self.order_manager.submit_entry(
                 symbol=symbol,
@@ -693,7 +830,7 @@ class TradingScheduler:
                         "side": approval_side,
                         "size": size_coins,
                         "price": entry_px,
-                        "pnl": 0.0,  # PnL unknown at entry time
+                        "pnl": 0.0,
                     }
                 )
 
@@ -707,6 +844,67 @@ class TradingScheduler:
         return result
 
     # ------------------------------------------------------------------
+    # Multi-timeframe regime features
+    # ------------------------------------------------------------------
+
+    def _compute_regime_features(self, symbol: str, signal_features: dict) -> dict:
+        """Compute regime features from higher timeframe candles.
+
+        Falls back to signal-timeframe features if higher-TF data is
+        unavailable or insufficient.
+        """
+        regime_features = dict(signal_features)  # start with signal TF features
+
+        for tf in self._regime_timeframes:
+            try:
+                htf_candles = self.store.read_candles(
+                    symbol=symbol,
+                    timeframe=tf,
+                    start_ms=0,
+                    end_ms=now_ms(),
+                )
+
+                if htf_candles.empty or len(htf_candles) < 30:
+                    continue
+
+                close = htf_candles["close"]
+                high = htf_candles["high"]
+                low = htf_candles["low"]
+
+                # Override key regime features with higher-TF values
+                _adx = compute_adx(high, low, close, period=14)
+                htf_adx = self._last_valid(_adx)
+                if htf_adx is not None:
+                    regime_features[f"adx_{tf}"] = htf_adx
+                    regime_features["adx"] = htf_adx  # override signal-TF
+
+                _hurst = hurst_exponent(close, max_lag=20)
+                htf_hurst = self._last_valid(_hurst)
+                if htf_hurst is not None:
+                    regime_features[f"hurst_{tf}"] = htf_hurst
+                    regime_features["hurst"] = htf_hurst
+
+                _rvol = compute_realized_vol(close, period=20)
+                htf_rvol = self._last_valid(_rvol)
+                if htf_rvol is not None:
+                    regime_features[f"realized_vol_{tf}"] = htf_rvol
+
+                _slope = compute_ma_slope(close, period=20, lookback=5)
+                htf_slope = self._last_valid(_slope)
+                if htf_slope is not None:
+                    regime_features[f"ma_slope_{tf}"] = htf_slope
+
+            except Exception as exc:
+                logger.debug(
+                    "scheduler.regime_tf_failed",
+                    symbol=symbol,
+                    timeframe=tf,
+                    error=str(exc),
+                )
+
+        return regime_features
+
+    # ------------------------------------------------------------------
     # Feature computation
     # ------------------------------------------------------------------
 
@@ -715,17 +913,6 @@ class TradingScheduler:
 
         This mirrors the feature computation in the backtest engine,
         ensuring consistency between backtested and live behaviour.
-
-        Parameters
-        ----------
-        candles : pd.DataFrame
-            OHLCV data with columns ``open``, ``high``, ``low``, ``close``,
-            ``volume``.
-
-        Returns
-        -------
-        dict
-            Feature name to latest scalar value.
         """
         close = candles["close"]
         high = candles["high"]
@@ -832,6 +1019,132 @@ class TradingScheduler:
         return float(val)
 
     # ------------------------------------------------------------------
+    # Order chase / re-pricing
+    # ------------------------------------------------------------------
+
+    def _chase_unfilled_orders(self) -> None:
+        """Check for stale unfilled limit orders and re-price them.
+
+        If an order has been pending longer than ``chase_timeout_sec`` and
+        hasn't exceeded ``chase_max_retries``, cancel and re-submit at
+        the current market price (with slippage cap).
+        """
+        active_orders = self.order_manager.get_active_orders()
+        current_ms = now_ms()
+        chase_timeout_ms = int(self._chase_timeout_sec * 1000)
+
+        for order in active_orders:
+            if order.state.value != "submitted":
+                continue
+
+            age_ms = current_ms - order.timestamp_ms
+            if age_ms < chase_timeout_ms:
+                continue
+
+            retries = order.metadata.get("chase_retries", 0) if hasattr(order, "metadata") else 0
+            if retries >= self._chase_max_retries:
+                logger.info(
+                    "scheduler.chase.max_retries",
+                    order_id=order.order_id,
+                    retries=retries,
+                )
+                # Cancel the order instead of chasing further
+                try:
+                    self.order_manager.cancel_trade_orders(order.trade_id)
+                except Exception:
+                    pass
+                continue
+
+            # Re-price: fetch current book and adjust price
+            symbol = order.symbol
+            try:
+                book = snapshot_l2(self.client, symbol)
+                mid_px = book.get("mid_px", 0.0)
+                if mid_px <= 0:
+                    continue
+
+                # Check slippage from original price
+                orig_px = order.price
+                if orig_px > 0:
+                    slippage_bps = abs(mid_px - orig_px) / orig_px * 10_000
+                    if slippage_bps > self._max_slippage_bps:
+                        logger.info(
+                            "scheduler.chase.slippage_exceeded",
+                            order_id=order.order_id,
+                            slippage_bps=round(slippage_bps, 2),
+                        )
+                        self.order_manager.cancel_trade_orders(order.trade_id)
+                        continue
+
+                # Cancel and re-submit at new price
+                self.broker.cancel_order(symbol, order.order_id)
+                new_px = self._round_price(symbol, mid_px)
+
+                new_result = self.broker.place_order(
+                    symbol=symbol,
+                    side=order.side,
+                    size=order.remaining_size,
+                    price=new_px,
+                    order_type="limit",
+                    tif="Ioc",  # IOC for chase orders to avoid stacking
+                )
+
+                metrics.inc_counter("orders_chased_total")
+                logger.info(
+                    "scheduler.chase.repriced",
+                    order_id=order.order_id,
+                    old_px=orig_px,
+                    new_px=new_px,
+                    new_status=new_result.status,
+                )
+
+            except Exception as exc:
+                logger.warning(
+                    "scheduler.chase.failed",
+                    order_id=order.order_id,
+                    error=str(exc),
+                )
+
+    # ------------------------------------------------------------------
+    # Drift response
+    # ------------------------------------------------------------------
+
+    def _handle_drift(self, drift_result: dict) -> None:
+        """Take automated action based on drift severity.
+
+        - warning: reduce exposure by cancelling open orders for new entries
+        - critical: halt trading via kill switch
+        """
+        severity = drift_result.get("severity", "none")
+        action = drift_result.get("action", "continue")
+
+        logger.warning(
+            "scheduler.drift_detected",
+            severity=severity,
+            action=action,
+            signals=drift_result.get("signals"),
+        )
+
+        if severity == "critical" or action == "halt_trading_and_review":
+            logger.critical("scheduler.drift_critical_halt")
+            self.kill_switch.trigger(
+                reason=f"Critical drift detected: {drift_result.get('signals')}"
+            )
+        elif severity == "warning" or action == "reduce_exposure":
+            if not self._drift_reduced:
+                logger.warning("scheduler.drift_reducing_exposure")
+                # Cancel all pending entry orders to stop new positions
+                try:
+                    self.broker.cancel_all()
+                    metrics.inc_counter("drift_exposure_reductions_total")
+                except Exception:
+                    pass
+                self._drift_reduced = True
+        else:
+            # Drift cleared -- allow trading again
+            self._drift_reduced = False
+
+    # ------------------------------------------------------------------
     # Reconciliation
     # ------------------------------------------------------------------
 
@@ -842,15 +1155,20 @@ class TradingScheduler:
         for fill in fills:
             self.reconciler.process_fill(fill)
 
+            # Fill quality metrics
+            fill_px = float(fill.get("price", fill.get("px", 0.0)))
+            if fill_px > 0:
+                metrics.observe("fill_price", fill_px)
+            fill_fee = float(fill.get("fee", 0.0))
+            if fill_fee > 0:
+                metrics.observe("fill_fee_usd", fill_fee)
+
     # ------------------------------------------------------------------
     # Equity / risk state
     # ------------------------------------------------------------------
 
     def _update_equity(self) -> None:
-        """Fetch user state from the exchange and update the equity tracker.
-
-        Falls back to the last known equity on failure (best-effort).
-        """
+        """Fetch user state from the exchange and update the equity tracker."""
         try:
             user_state = fetch_user_state(self.client)
             account_value = user_state.get("account_value", 0.0)
@@ -858,7 +1176,6 @@ class TradingScheduler:
                 self._equity = account_value
                 self._peak_equity = max(self._peak_equity, self._equity)
 
-            # Sync positions with the exchange
             positions = user_state.get("positions", [])
             if positions:
                 self.reconciler.sync_positions(positions)

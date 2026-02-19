@@ -1,2 +1,24 @@
-# Live — full caps. Only after canary pass and gates.
+# Live — full caps. Only runs after canary pass and governance gates.
+# Merges on top of base.yaml.
 env: live
+
+risk:
+  equity_risk_per_trade_min: 0.002
+  equity_risk_per_trade_max: 0.01
+  max_concurrent_positions: 4
+  max_total_notional_multiple: 2.5
+  daily_loss_limit_pct: 0.05
+  weekly_loss_limit_pct: 0.12
+  max_drawdown_pct: 0.18
+  max_leverage: 20
+
+execution:
+  prefer_maker: true
+  max_slippage_bps: 5.0
+  max_order_retries: 3
+  chase_seconds: 8
+  post_only_on_entries: true
+
+observability:
+  log_level: "INFO"
+  alert_webhook_url: "${ALERT_WEBHOOK_URL:}"

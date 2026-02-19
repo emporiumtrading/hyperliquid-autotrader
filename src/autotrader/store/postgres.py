@@ -95,11 +95,32 @@ class PostgresStore(DataStore):
     # ------------------------------------------------------------------
 
     def _ensure_tables(self) -> None:
-        """Create tables if they do not already exist."""
+        """Create tables and performance indexes if they do not already exist."""
         with self._conn.cursor() as cur:
             cur.execute(_CREATE_CANDLES)
             cur.execute(_CREATE_FILLS)
             cur.execute(_CREATE_FUNDING)
+            # Performance indexes for common query patterns
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_candles_symbol_ts "
+                "ON candles (symbol, timestamp_ms)"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_candles_timeframe "
+                "ON candles (timeframe)"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_fills_ts "
+                "ON fills (timestamp_ms)"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_fills_symbol "
+                "ON fills (symbol)"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_funding_symbol_ts "
+                "ON funding (symbol, timestamp_ms)"
+            )
         logger.info("postgres_tables_ensured")
 
     def _execute_many(self, sql: str, rows: list[tuple[Any, ...]]) -> int:

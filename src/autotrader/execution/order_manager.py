@@ -109,6 +109,26 @@ class ManagedOrder:
     tp_px: float | None = None
     parent_trade_id: str = ""
     error: str = ""
+    metadata: dict = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.metadata is None:
+            self.metadata = {}
+
+    @property
+    def remaining_size(self) -> float:
+        """Size remaining to be filled."""
+        return max(0.0, self.size - self.filled_size)
+
+    @property
+    def timestamp_ms(self) -> int:
+        """Alias for ``created_at`` for compatibility."""
+        return self.created_at
+
+    @property
+    def trade_id(self) -> str:
+        """Alias for ``parent_trade_id`` for compatibility."""
+        return self.parent_trade_id
 
 
 # ---------------------------------------------------------------------------
@@ -468,6 +488,112 @@ class OrderManager:
             if managed is not None:
                 result.append(managed)
         return result
+
+    # ------------------------------------------------------------------
+    # Trailing stop management
+    # ------------------------------------------------------------------
+
+    def update_trailing_stop(
+        self,
+        trade_id: str,
+        current_price: float,
+        trail_atr: float,
+        trail_multiplier: float = 2.0,
+    ) -> bool:
+        """Adjust a trade's stop-loss to trail the price.
+
+        For a long trade, the stop moves up as the price rises.
+        For a short trade, the stop moves down as the price falls.
+        The stop never moves in the unfavourable direction.
+
+        Parameters
+        ----------
+        trade_id:
+            The trade whose stop to adjust.
+        current_price:
+            Current market price.
+        trail_atr:
+            Current ATR value used to compute trail distance.
+        trail_multiplier:
+            ATR multiple for the trailing distance (default 2.0).
+
+        Returns
+        -------
+        bool
+            ``True`` if the stop was moved, ``False`` otherwise.
+        """
+        order_ids = self.trade_orders.get(trade_id, [])
+        stop_order: ManagedOrder | None = None
+        entry_side: str = "buy"
+
+        for oid in order_ids:
+            managed = self.orders.get(oid)
+            if managed is None:
+                continue
+            if managed.order_type == "stop_loss" and managed.state in _ACTIVE_STATES:
+                stop_order = managed
+            if managed.order_type in ("limit", "market") and managed.state == OrderState.FILLED:
+                entry_side = managed.side
+
+        if stop_order is None or trail_atr <= 0:
+            return False
+
+        trail_distance = trail_atr * trail_multiplier
+        old_stop = stop_order.price
+
+        if entry_side == "buy":
+            # Long position: new stop = current_price - trail_distance
+            new_stop = current_price - trail_distance
+            # Only move stop up, never down
+            if new_stop <= old_stop:
+                return False
+        else:
+            # Short position: new stop = current_price + trail_distance
+            new_stop = current_price + trail_distance
+            # Only move stop down, never up
+            if new_stop >= old_stop:
+                return False
+
+        # Cancel old stop and place new one
+        self.broker.cancel_order(stop_order.symbol, stop_order.order_id)
+        stop_order.state = OrderState.CANCELLED
+        stop_order.updated_at = now_ms()
+
+        exit_side = "sell" if entry_side == "buy" else "buy"
+        sl_result = self.broker.place_trigger_order(
+            symbol=stop_order.symbol,
+            side=exit_side,
+            size=stop_order.size,
+            trigger_px=new_stop,
+            order_type="stop_loss",
+        )
+
+        sl_state = self._map_status(sl_result.status)
+        new_managed = ManagedOrder(
+            order_id=sl_result.order_id,
+            symbol=stop_order.symbol,
+            side=exit_side,
+            size=stop_order.size,
+            price=new_stop,
+            order_type="stop_loss",
+            state=sl_state,
+            created_at=now_ms(),
+            updated_at=now_ms(),
+            stop_px=new_stop,
+            parent_trade_id=trade_id,
+            error=sl_result.error,
+        )
+        self.orders[sl_result.order_id] = new_managed
+        self.trade_orders.setdefault(trade_id, []).append(sl_result.order_id)
+
+        logger.info(
+            "trailing_stop_updated",
+            trade_id=trade_id,
+            old_stop=old_stop,
+            new_stop=new_stop,
+            current_price=current_price,
+        )
+        return True
 
     # ------------------------------------------------------------------
     # Internal helpers

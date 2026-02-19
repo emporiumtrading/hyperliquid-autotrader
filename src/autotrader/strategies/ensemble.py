@@ -9,19 +9,23 @@ from __future__ import annotations
 
 from autotrader.hl.types import Signal
 from autotrader.strategies.base import BaseStrategy, MarketContext, flat_signal
+from autotrader.strategies.crash_meanrev import CrashMeanRevStrategy
 from autotrader.strategies.funding_extremes import FundingExtremesStrategy
 from autotrader.strategies.range_meanrev import RangeMeanRevStrategy
+from autotrader.strategies.squeeze_breakout import SqueezeBreakoutStrategy
 from autotrader.strategies.trend_breakout import TrendBreakoutStrategy
 from autotrader.strategies.vol_expansion import VolExpansionStrategy
 
 
 def _build_default_strategies() -> list[BaseStrategy]:
-    """Instantiate the four built-in strategies with default configs."""
+    """Instantiate the six built-in strategies with default configs."""
     return [
         TrendBreakoutStrategy(),
         RangeMeanRevStrategy(),
         VolExpansionStrategy(),
         FundingExtremesStrategy(),
+        SqueezeBreakoutStrategy(),
+        CrashMeanRevStrategy(),
     ]
 
 

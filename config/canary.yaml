@@ -1,2 +1,27 @@
-# Canary — live orders with reduced size/caps; probation.
+# Canary — live orders with reduced size/caps; probation evaluator active.
+# Merges on top of base.yaml.
 env: canary
+
+risk:
+  equity_risk_per_trade_min: 0.001   # half of normal min
+  equity_risk_per_trade_max: 0.005   # half of normal max
+  max_concurrent_positions: 2        # reduced from 4
+  max_total_notional_multiple: 1.0   # reduced from 2.5
+  daily_loss_limit_pct: 0.03         # tighter than live
+  weekly_loss_limit_pct: 0.06        # tighter than live
+  max_drawdown_pct: 0.10             # tighter than live
+
+execution:
+  prefer_maker: true
+  max_slippage_bps: 3.0              # tighter slippage
+  chase_seconds: 5                   # shorter chase
+
+probation:
+  duration_days: 7
+  min_trades: 10
+  max_drawdown_pct: 0.10
+  min_profit_factor: 1.0
+
+governance:
+  require_walkforward: true
+  require_robustness: true
