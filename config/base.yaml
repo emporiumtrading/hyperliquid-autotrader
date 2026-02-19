@@ -32,6 +32,30 @@ risk:
   min_expected_rr: 1.8
   liquidation_buffer_pct: 0.25
 
+strategy:
+  # Per-strategy parameter overrides (keys must match strategy names).
+  # Omitted strategies keep their built-in defaults.
+  strategy_params:
+    trend_breakout:
+      lookback: 20
+      atr_multiplier_stop: 2.0
+      atr_multiplier_tp: 3.0
+      min_adx: 25.0
+    range_meanrev:
+      rsi_oversold: 30.0
+      rsi_overbought: 70.0
+      atr_multiplier_stop: 1.5
+    # vol_expansion: {}
+    # funding_extremes: {}
+    # squeeze_breakout: {}
+    # crash_meanrev: {}
+
+  # Regime-specific strategy weights (optional).
+  # regime_weights:
+  #   TREND:
+  #     trend_breakout: 1.0
+  #     funding_extremes: 0.5
+
 execution:
   prefer_maker: true
   max_slippage_bps: 5.0

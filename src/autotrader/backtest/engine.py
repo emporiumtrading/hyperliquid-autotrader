@@ -7,6 +7,7 @@ costs.
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
 
 import pandas as pd
@@ -128,8 +129,9 @@ class BacktestEngine:
         self.config = config
 
         # Strategy
+        strategy_cfg = config.get("strategy", None)
         self.strategy: BaseStrategy | EnsembleStrategy = (
-            strategy if strategy is not None else EnsembleStrategy()
+            strategy if strategy is not None else EnsembleStrategy(config=strategy_cfg)
         )
 
         # Cost model
@@ -159,6 +161,10 @@ class BacktestEngine:
         self._warmup_bars: int = int(config.get("warmup_bars", 50))
         self._funding_rate: float = float(config.get("funding_rate", 0.0001))
         self._bar_hours: float = float(config.get("bar_hours", 0.25))
+
+        # Per-asset metadata for lot/tick rounding (PRD §11.2.5)
+        # Keys: symbol -> {"sz_decimals": int, "max_leverage": int}
+        self._asset_meta: dict[str, dict] = config.get("asset_meta", {})
 
     # ------------------------------------------------------------------
     # Main loop
@@ -453,6 +459,32 @@ class BacktestEngine:
         return float(val)
 
     # ------------------------------------------------------------------
+    # Lot / tick rounding (PRD §11.2.5: "HL tick/lot from metadata")
+    # ------------------------------------------------------------------
+
+    def _round_size(self, symbol: str, size: float) -> float:
+        """Round order size to the exchange's sz_decimals for the asset.
+
+        Mirrors :meth:`TradingScheduler._round_size` for live/backtest parity.
+        """
+        meta = self._asset_meta.get(symbol, {})
+        sz_decimals = meta.get("sz_decimals", 3)
+        factor = 10**sz_decimals
+        return math.floor(size * factor) / factor
+
+    def _round_price(self, symbol: str, price: float) -> float:
+        """Round price to 5 significant figures.
+
+        Mirrors :meth:`TradingScheduler._round_price` for live/backtest parity.
+        """
+        if price <= 0:
+            return 0.0
+        magnitude = math.floor(math.log10(abs(price)))
+        decimals = max(0, 4 - magnitude)
+        factor = 10**decimals
+        return round(price * factor) / factor
+
+    # ------------------------------------------------------------------
     # Exit checking
     # ------------------------------------------------------------------
 
@@ -531,10 +563,18 @@ class BacktestEngine:
             Mutable dict of currently open trades.
         """
         trade_id = generate_trade_id()
-        entry_px = signal.entry if signal.entry is not None else 0.0
-        size_coins = approval.get("size_coins", 0.0)
-        size_usd = approval.get("size_usd", 0.0)
+        raw_entry_px = signal.entry if signal.entry is not None else 0.0
+        raw_size_coins = approval.get("size_coins", 0.0)
         leverage = approval.get("leverage", 1.0)
+
+        # Apply lot/tick rounding (PRD §11.2.5: parity with live)
+        size_coins = self._round_size(symbol, raw_size_coins)
+        entry_px = self._round_price(symbol, raw_entry_px)
+
+        if size_coins <= 0:
+            return  # rounded to zero — skip
+
+        size_usd = size_coins * entry_px if entry_px > 0 else approval.get("size_usd", 0.0)
 
         # Entry slippage -- deducted from equity via cost accounting
         entry_slip = self.cost_model.compute_slippage(size_usd)
@@ -551,8 +591,8 @@ class BacktestEngine:
             size=size_coins,
             notional=size_usd,
             leverage=leverage,
-            stop=signal.stop if signal.stop is not None else 0.0,
-            take_profit=signal.take_profit if signal.take_profit is not None else 0.0,
+            stop=self._round_price(symbol, signal.stop) if signal.stop else 0.0,
+            take_profit=self._round_price(symbol, signal.take_profit) if signal.take_profit else 0.0,
             fees=entry_fee,
             slippage=entry_slip,
         )

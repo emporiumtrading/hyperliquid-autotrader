@@ -584,9 +584,22 @@ class TradingScheduler:
     # ------------------------------------------------------------------
 
     def _refresh_universe(self) -> list[str]:
-        """Fetch asset contexts and select top-N symbols by liquidity.
+        """Fetch asset contexts and select top-N symbols by composite
+        Liquidity Score.
 
-        Applies volume, spread, and depth filters per PRD section 6.1.
+        PRD §6.1: "Every hour (or faster): compute Liquidity Score per
+        market (metaAndAssetCtxs + l2Book + recent volume)."
+
+        The score weights:
+          - 40% normalised daily notional volume
+          - 25% normalised open interest
+          - 20% inverse spread (tighter = better)
+          - 15% L2 book depth
+
+        Then applies hard exclusion filters:
+          - spread > max_spread_bps
+          - depth < min_depth_usd
+          - abnormal funding volatility (|funding| > 0.5% per 8h)
         """
         if self._static_universe:
             return list(self._static_universe)
@@ -597,46 +610,82 @@ class TradingScheduler:
             logger.warning("scheduler.universe.no_contexts")
             return list(self.universe) if self.universe else []
 
-        # Filter by minimum volume
+        # Hard filter: minimum volume
         if self._min_volume > 0:
             ctx_df = ctx_df[ctx_df["day_ntl_vlm"] >= self._min_volume]
 
-        # Sort by daily notional volume descending and pick top N candidates
-        ctx_df = ctx_df.sort_values("day_ntl_vlm", ascending=False)
-        candidates = ctx_df["name"].head(self._top_n * 2).tolist()  # overfetch for filtering
+        if ctx_df.empty:
+            return list(self.universe) if self.universe else []
 
-        # Apply spread and depth filters
-        filtered: list[str] = []
-        for symbol in candidates:
-            if len(filtered) >= self._top_n:
-                break
+        # Pre-sort by volume to limit L2 lookups
+        ctx_df = ctx_df.sort_values("day_ntl_vlm", ascending=False)
+        candidates = ctx_df.head(self._top_n * 3)  # overfetch for filtering
+
+        # Collect L2 book data for each candidate
+        scored: list[tuple[str, float]] = []
+        for _, row in candidates.iterrows():
+            symbol = row["name"]
+            day_vlm = float(row.get("day_ntl_vlm", 0))
+            oi = float(row.get("open_interest", 0))
+            funding = float(row.get("funding", 0))
+
+            # Hard exclusion: abnormal funding volatility (>0.5% per 8h)
+            if abs(funding) > 0.005:
+                logger.debug(
+                    "scheduler.universe.funding_vol_filter",
+                    symbol=symbol,
+                    funding=funding,
+                )
+                continue
+
             try:
                 book = snapshot_l2(self.client, symbol)
                 spread = book.get("spread_bps", 999.0)
                 depth = book.get("bid_depth_usd", 0.0) + book.get("ask_depth_usd", 0.0)
-                if spread > self._max_spread_bps:
-                    logger.debug(
-                        "scheduler.universe.spread_filter",
-                        symbol=symbol,
-                        spread_bps=spread,
-                    )
-                    continue
-                if depth < self._min_depth_usd:
-                    logger.debug(
-                        "scheduler.universe.depth_filter",
-                        symbol=symbol,
-                        depth_usd=depth,
-                    )
-                    continue
-                filtered.append(symbol)
             except Exception:
-                # If we can't check L2, still include based on volume ranking
-                filtered.append(symbol)
+                spread = 999.0
+                depth = 0.0
+
+            # Hard exclusion filters
+            if spread > self._max_spread_bps:
+                logger.debug(
+                    "scheduler.universe.spread_filter",
+                    symbol=symbol,
+                    spread_bps=spread,
+                )
+                continue
+            if depth < self._min_depth_usd:
+                logger.debug(
+                    "scheduler.universe.depth_filter",
+                    symbol=symbol,
+                    depth_usd=depth,
+                )
+                continue
+
+            # Compute composite Liquidity Score (all components normalised 0-1)
+            vlm_score = min(day_vlm / 1e9, 1.0)  # normalise to $1B
+            oi_score = min(oi / 5e8, 1.0)  # normalise to $500M
+            spread_score = max(0.0, 1.0 - spread / self._max_spread_bps)
+            depth_score = min(depth / 2e6, 1.0)  # normalise to $2M
+
+            liquidity_score = (
+                0.40 * vlm_score
+                + 0.25 * oi_score
+                + 0.20 * spread_score
+                + 0.15 * depth_score
+            )
+
+            scored.append((symbol, liquidity_score))
+
+        # Sort by composite score descending, take top N
+        scored.sort(key=lambda x: x[1], reverse=True)
+        filtered = [sym for sym, _ in scored[: self._top_n]]
 
         logger.info(
             "scheduler.universe.refreshed",
             count=len(filtered),
             top_symbols=filtered[:5],
+            top_scores=[round(s, 4) for _, s in scored[:5]],
         )
         return filtered
 
@@ -766,8 +815,19 @@ class TradingScheduler:
         if signal.side == "flat":
             return result
 
-        # h. Risk approval
+        # g2. No averaging down: block if already holding same symbol + direction
         approval_side = _SIDE_TO_APPROVAL.get(signal.side, signal.side)
+        pos_side = "long" if approval_side == "buy" else "short"
+        existing_pos = self.exposure_tracker.get_position(symbol)
+        if existing_pos is not None and existing_pos.side == pos_side:
+            logger.debug(
+                "scheduler.no_averaging_down",
+                symbol=symbol,
+                side=pos_side,
+            )
+            return result
+
+        # h. Risk approval
         if approval_side not in ("buy", "sell"):
             return result
 

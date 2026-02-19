@@ -17,15 +17,26 @@ from autotrader.strategies.trend_breakout import TrendBreakoutStrategy
 from autotrader.strategies.vol_expansion import VolExpansionStrategy
 
 
-def _build_default_strategies() -> list[BaseStrategy]:
-    """Instantiate the six built-in strategies with default configs."""
+def _build_default_strategies(
+    strategy_params: dict | None = None,
+) -> list[BaseStrategy]:
+    """Instantiate the six built-in strategies.
+
+    Parameters
+    ----------
+    strategy_params : dict | None
+        Optional mapping of ``{strategy_name: {param: value, ...}}``.
+        Each sub-dict is forwarded to the corresponding strategy's
+        ``config`` argument, overriding its ``_DEFAULT_CONFIG``.
+    """
+    params = strategy_params or {}
     return [
-        TrendBreakoutStrategy(),
-        RangeMeanRevStrategy(),
-        VolExpansionStrategy(),
-        FundingExtremesStrategy(),
-        SqueezeBreakoutStrategy(),
-        CrashMeanRevStrategy(),
+        TrendBreakoutStrategy(config=params.get("trend_breakout")),
+        RangeMeanRevStrategy(config=params.get("range_meanrev")),
+        VolExpansionStrategy(config=params.get("vol_expansion")),
+        FundingExtremesStrategy(config=params.get("funding_extremes")),
+        SqueezeBreakoutStrategy(config=params.get("squeeze_breakout")),
+        CrashMeanRevStrategy(config=params.get("crash_meanrev")),
     ]
 
 
@@ -50,11 +61,17 @@ class EnsembleStrategy:
         strategies: list[BaseStrategy] | None = None,
         config: dict | None = None,
     ) -> None:
+        cfg = config or {}
+
+        # strategy_params: { "trend_breakout": { "lookback": 30, ... }, ... }
+        strategy_params: dict = cfg.get("strategy_params", {})
+
         self.strategies: list[BaseStrategy] = (
-            strategies if strategies is not None else _build_default_strategies()
+            strategies
+            if strategies is not None
+            else _build_default_strategies(strategy_params)
         )
 
-        cfg = config or {}
         # regime_weights: { "TREND": { "trend_breakout": 1.0, ... }, ... }
         self.regime_weights: dict[str, dict[str, float]] = cfg.get("regime_weights", {})
 
