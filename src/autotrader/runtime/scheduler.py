@@ -31,6 +31,7 @@ from autotrader.data.transforms.resample import resample_ohlcv
 from autotrader.execution.broker import Broker
 from autotrader.execution.order_manager import OrderManager
 from autotrader.execution.reconciliation import Reconciler
+from autotrader.execution.ws_reconciler import WSOrderReconciler
 from autotrader.features.positioning import (
     funding_rate_percentile,
     funding_rate_zscore,
@@ -148,6 +149,12 @@ class TradingScheduler:
         self.reconciler: Reconciler = Reconciler(
             exposure_tracker=self.exposure_tracker,
             order_manager=self.order_manager,
+        )
+
+        # ---- WS-based reconciliation (PRD §10: orderUpdates WS) ----
+        self.ws_reconciler: WSOrderReconciler = WSOrderReconciler(
+            ws_url=hl_cfg.get("ws_url", "wss://api.hyperliquid.xyz/ws"),
+            user_address=hl_cfg.get("account_address", ""),
         )
 
         # ---- Order chase config ----
@@ -497,10 +504,14 @@ class TradingScheduler:
         self.running = True
         iteration = 0
 
+        # Start the WS reconciler for real-time orderUpdates + userFills
+        self.ws_reconciler.start()
+
         logger.info(
             "scheduler.loop.start",
             poll_interval_sec=self.poll_interval_sec,
             max_iterations=max_iterations,
+            ws_reconciler_active=self.ws_reconciler.is_running,
         )
 
         try:
@@ -549,6 +560,12 @@ class TradingScheduler:
         """Gracefully shut down the scheduler."""
         self.running = False
         logger.info("scheduler.shutdown.start")
+
+        # Stop WS reconciler first (background thread)
+        try:
+            self.ws_reconciler.stop()
+        except Exception as exc:
+            logger.error("scheduler.shutdown.ws_reconciler_stop_failed", error=str(exc))
 
         try:
             cancelled = self.broker.cancel_all()
@@ -699,9 +716,16 @@ class TradingScheduler:
             return result
 
         # e. Classify regime with hysteresis (using higher-TF features)
-        raw_regime, raw_confidence = self.regime_classifier.classify(regime_features)
+        regime_result = self.regime_classifier.classify_with_book(
+            regime_features, book=book
+        )
+        raw_regime = regime_result["regime"]
+        raw_confidence = regime_result["confidence"]
+        expected_slippage_bps = regime_result.get("expected_slippage_bps", 1.0)
         effective_regime = self.hysteresis.update(raw_regime, raw_confidence)
         effective_confidence = self.hysteresis.current_confidence
+
+        metrics.set_gauge("expected_slippage_bps", expected_slippage_bps)
 
         # f. Build MarketContext
         funding_rate: float | None = None
@@ -1149,19 +1173,124 @@ class TradingScheduler:
     # ------------------------------------------------------------------
 
     def _reconcile_fills(self) -> None:
-        """Fetch recent fills from the broker and process them through
-        the reconciler."""
-        fills = self.broker.get_fills()
-        for fill in fills:
-            self.reconciler.process_fill(fill)
+        """Reconcile order state using WS orderUpdates + REST fills.
 
-            # Fill quality metrics
-            fill_px = float(fill.get("price", fill.get("px", 0.0)))
-            if fill_px > 0:
-                metrics.observe("fill_price", fill_px)
-            fill_fee = float(fill.get("fee", 0.0))
-            if fill_fee > 0:
-                metrics.observe("fill_fee_usd", fill_fee)
+        PRD §10: "Reconciliation: orderUpdates WS + orderStatus REST."
+
+        1. Drain real-time orderUpdates from the WS reconciler and apply
+           status changes (filled, cancelled, rejected) immediately.
+        2. Drain real-time userFills from the WS reconciler.
+        3. Fetch fills from REST as a fallback/verification layer.
+        """
+        # --- WS orderUpdates (real-time status changes) ---
+        ws_order_updates = self.ws_reconciler.drain_order_updates()
+        for update in ws_order_updates:
+            self._process_ws_order_update(update)
+
+        # --- WS userFills (real-time fill events) ---
+        ws_fills = self.ws_reconciler.drain_user_fills()
+        for ws_fill in ws_fills:
+            fill = self._normalise_ws_fill(ws_fill)
+            if fill:
+                self.reconciler.process_fill(fill)
+                self._emit_fill_metrics(fill)
+
+        # --- REST fills (fallback / verification) ---
+        rest_fills = self.broker.get_fills()
+        for fill in rest_fills:
+            self.reconciler.process_fill(fill)
+            self._emit_fill_metrics(fill)
+
+    def _process_ws_order_update(self, update: dict) -> None:
+        """Apply a single WS orderUpdate to the order manager.
+
+        Handles status transitions: filled, cancelled, rejected, and
+        optionally verifies via ``orderStatus`` REST for ambiguous states.
+        """
+        order_info = update.get("order", update)
+        status = update.get("status", "")
+        oid = str(order_info.get("oid", ""))
+
+        if not oid or not status:
+            return
+
+        if status == "filled":
+            # Mark order as filled in the order manager
+            filled_sz = float(order_info.get("sz", 0))
+            filled_px = float(order_info.get("limitPx", 0))
+            self.order_manager.update_order(
+                order_id=oid,
+                status="filled",
+                filled_sz=filled_sz,
+                filled_px=filled_px,
+            )
+            metrics.inc_counter("ws_orders_filled_total")
+            logger.info("scheduler.ws_order_filled", oid=oid)
+
+        elif status in ("canceled", "cancelled"):
+            self.order_manager.update_order(order_id=oid, status="cancelled")
+            metrics.inc_counter("ws_orders_cancelled_total")
+            logger.info("scheduler.ws_order_cancelled", oid=oid)
+
+        elif status == "rejected":
+            self.order_manager.update_order(order_id=oid, status="rejected")
+            metrics.inc_counter("ws_orders_rejected_total")
+            logger.info("scheduler.ws_order_rejected", oid=oid)
+
+        elif status == "open" or status == "resting":
+            # Order acknowledged by exchange, no action needed
+            pass
+
+        else:
+            # Ambiguous status — verify via REST orderStatus
+            self._verify_order_status_rest(oid)
+
+    def _verify_order_status_rest(self, oid: str) -> None:
+        """Query orderStatus REST endpoint for ground truth on an order."""
+        try:
+            result = self.client.get_order_status(int(oid))
+            rest_status = result.get("status", "")
+            logger.info(
+                "scheduler.order_status_verified",
+                oid=oid,
+                rest_status=rest_status,
+            )
+        except Exception as exc:
+            logger.debug(
+                "scheduler.order_status_verify_failed",
+                oid=oid,
+                error=str(exc),
+            )
+
+    @staticmethod
+    def _normalise_ws_fill(ws_fill: dict) -> dict | None:
+        """Convert a WS userFill message to the standard fill format.
+
+        Returns None if the message cannot be parsed.
+        """
+        try:
+            return {
+                "order_id": str(ws_fill.get("oid", "")),
+                "symbol": ws_fill.get("coin", ""),
+                "side": ws_fill.get("side", "").lower(),
+                "size": float(ws_fill.get("sz", 0)),
+                "price": float(ws_fill.get("px", 0)),
+                "fee": float(ws_fill.get("fee", 0)),
+                "timestamp_ms": int(ws_fill.get("time", 0)),
+            }
+        except (TypeError, ValueError) as exc:
+            logger.debug("scheduler.ws_fill_parse_failed", error=str(exc))
+            return None
+
+    @staticmethod
+    def _emit_fill_metrics(fill: dict) -> None:
+        """Emit fill quality metrics for a single fill."""
+        fill_px = float(fill.get("price", fill.get("px", 0.0)))
+        if fill_px > 0:
+            metrics.observe("fill_price", fill_px)
+        fill_fee = float(fill.get("fee", 0.0))
+        if fill_fee > 0:
+            metrics.observe("fill_fee_usd", fill_fee)
 
     # ------------------------------------------------------------------
     # Equity / risk state

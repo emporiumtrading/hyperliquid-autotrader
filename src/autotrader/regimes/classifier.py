@@ -209,6 +209,13 @@ class RegimeClassifier:
         Returns
         -------
         (regime_label, confidence) : tuple[str, float]
+
+        Notes
+        -----
+        The PRD also specifies ``expected_slippage_bps`` in the regime
+        output.  This value depends on L2 book data which the classifier
+        does not receive directly.  Use :meth:`classify_with_book` for
+        the full output including slippage estimation.
         """
         # Extract features with safe defaults
         adx = self._safe_get(features, "adx")
@@ -263,6 +270,57 @@ class RegimeClassifier:
             return ("UNKNOWN", confidence)
 
         return (max_regime, round(confidence, 4))
+
+    def classify_with_book(
+        self,
+        features: dict,
+        book: dict | None = None,
+    ) -> dict:
+        """Classify regime and return full output including slippage estimate.
+
+        This is the PRD-compliant version that returns all three fields:
+        ``regime``, ``confidence``, and ``expected_slippage_bps``.
+
+        Parameters
+        ----------
+        features : dict
+            Feature dictionary (same as :meth:`classify`).
+        book : dict | None
+            L2 book snapshot from :func:`snapshot_l2`, with keys like
+            ``spread_bps``, ``bid_depth_usd``, ``ask_depth_usd``.
+
+        Returns
+        -------
+        dict
+            ``{"regime": str, "confidence": float, "expected_slippage_bps": float}``
+        """
+        regime, confidence = self.classify(features)
+
+        # Estimate expected slippage from L2 book data
+        expected_slippage_bps = 1.0  # base minimum
+        if book is not None:
+            spread_bps = book.get("spread_bps", 2.0)
+            bid_depth = book.get("bid_depth_usd", 0.0)
+            ask_depth = book.get("ask_depth_usd", 0.0)
+            total_depth = bid_depth + ask_depth
+
+            # Half-spread component
+            expected_slippage_bps = spread_bps / 2.0
+
+            # Depth penalty: less depth = more slippage
+            if total_depth > 0 and total_depth < 500_000:
+                depth_penalty = (500_000 - total_depth) / 500_000 * 2.0
+                expected_slippage_bps += depth_penalty
+
+            # Volatility penalty: high vol regimes tend to have wider fills
+            if regime in ("VOLATILE_BREAKOUT", "MEAN_REVERT_CRASH"):
+                expected_slippage_bps *= 1.5
+
+        return {
+            "regime": regime,
+            "confidence": confidence,
+            "expected_slippage_bps": round(expected_slippage_bps, 2),
+        }
 
 
 # ------------------------------------------------------------------

@@ -331,7 +331,7 @@ class HLClient:
         logger.info("place_order", order=order)
         return self._post_exchange(order)
 
-    def cancel_order(self, asset: int, oid: int) -> dict:
+    def cancel_order(self, asset: int, oid: int, nonce: int | None = None) -> dict:
         """Cancel a single order.
 
         Parameters
@@ -340,22 +340,37 @@ class HLClient:
             Asset index.
         oid : int
             Order ID to cancel.
+        nonce : int | None
+            Request nonce.  If ``None``, one is obtained from the nonce
+            manager automatically.
         """
+        from autotrader.hl.nonces import get_next as get_next_nonce
+
         payload = {
             "action": {
                 "type": "cancel",
                 "cancels": [{"asset": asset, "oid": oid}],
             },
+            "nonce": nonce if nonce is not None else get_next_nonce(),
         }
         logger.info("cancel_order", asset=asset, oid=oid)
         return self._post_exchange(payload)
 
-    def cancel_all(self) -> dict:
-        """Cancel all open orders for the configured account."""
+    def cancel_all(self, nonce: int | None = None) -> dict:
+        """Cancel all open orders for the configured account.
+
+        Parameters
+        ----------
+        nonce : int | None
+            Request nonce.  If ``None``, one is obtained automatically.
+        """
+        from autotrader.hl.nonces import get_next as get_next_nonce
+
         payload = {
             "action": {
                 "type": "cancelByCloid",
             },
+            "nonce": nonce if nonce is not None else get_next_nonce(),
         }
         logger.info("cancel_all")
         return self._post_exchange(payload)
