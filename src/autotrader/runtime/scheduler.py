@@ -52,6 +52,9 @@ from autotrader.features.technical import (
     ma_slope as compute_ma_slope,
 )
 from autotrader.features.technical import (
+    parkinson_vol as compute_parkinson_vol,
+)
+from autotrader.features.technical import (
     realized_vol as compute_realized_vol,
 )
 from autotrader.features.technical import (
@@ -1093,6 +1096,10 @@ class TradingScheduler:
         _rvol = compute_realized_vol(close, period=20)
         features["realized_vol"] = self._last_valid(_rvol)
 
+        # Parkinson vol (PRD §7.1: high-low range estimator)
+        _pvol = compute_parkinson_vol(high, low, period=20)
+        features["parkinson_vol"] = self._last_valid(_pvol)
+
         # Vol ratio (short-term / long-term realized vol)
         if len(close) >= 60:
             _rvol_long = compute_realized_vol(close, period=60)
@@ -1112,6 +1119,9 @@ class TradingScheduler:
         # Volume SMA
         _vsma = compute_volume_sma(volume, period=20)
         features["volume_sma"] = self._last_valid(_vsma)
+
+        # Current bar volume (for strategy volume confirmation)
+        features["current_volume"] = float(volume.iloc[-1]) if len(volume) > 0 else 0.0
 
         # Wick ratio
         _wick = compute_wick_ratio(open_, high, low, close)
