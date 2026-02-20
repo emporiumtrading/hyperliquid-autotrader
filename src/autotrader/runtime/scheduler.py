@@ -433,6 +433,10 @@ class TradingScheduler:
                 "scheduler.kill_switch_auto_triggered",
                 reason=self.kill_switch.trigger_reason(),
             )
+            audit.log_event(
+                "kill_switch_triggered",
+                {"reason": self.kill_switch.trigger_reason()},
+            )
             try:
                 self.broker.cancel_all()
             except Exception:
@@ -757,6 +761,12 @@ class TradingScheduler:
         # c2. Multi-TF regime features: compute from higher TF candles
         regime_features = self._compute_regime_features(symbol, features)
 
+        # c3. Merge HTF features into signal-TF features so strategies can
+        #     access higher-timeframe data (PRD §8: "4h trend filter", "1h range filter").
+        for key, val in regime_features.items():
+            if key != "adx" and key != "hurst":  # don't override signal-TF adx/hurst
+                features[key] = val
+
         # d. No-trade window check
         ntw_reason = self._check_no_trade_window(symbol, candles, features)
         if ntw_reason:
@@ -776,6 +786,16 @@ class TradingScheduler:
         effective_confidence = self.hysteresis.current_confidence
 
         metrics.set_gauge("expected_slippage_bps", expected_slippage_bps)
+
+        # e2. Reject if expected slippage exceeds configured max (PRD §9.2)
+        if expected_slippage_bps > self._max_slippage_bps:
+            logger.info(
+                "scheduler.slippage_too_high",
+                symbol=symbol,
+                expected_bps=expected_slippage_bps,
+                max_bps=self._max_slippage_bps,
+            )
+            return result
 
         # f. Build MarketContext
         funding_rate: float | None = None
@@ -1237,6 +1257,14 @@ class TradingScheduler:
             severity=severity,
             action=action,
             signals=drift_result.get("signals"),
+        )
+        audit.log_event(
+            "drift_detected",
+            {
+                "severity": severity,
+                "action": action,
+                "signals": drift_result.get("signals"),
+            },
         )
 
         if severity == "critical" or action == "halt_trading_and_review":

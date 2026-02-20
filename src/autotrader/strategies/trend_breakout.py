@@ -15,6 +15,7 @@ _DEFAULT_CONFIG: dict = {
     "atr_multiplier_stop": 2.0,
     "atr_multiplier_tp": 3.0,
     "min_adx": 25.0,
+    "htf_min_adx": 20.0,
     "trend_ma_period": 50,
     "pullback_rsi_long": 40.0,
     "pullback_rsi_short": 60.0,
@@ -42,6 +43,7 @@ class TrendBreakoutStrategy(BaseStrategy):
         self.atr_multiplier_stop: float = float(merged["atr_multiplier_stop"])
         self.atr_multiplier_tp: float = float(merged["atr_multiplier_tp"])
         self.min_adx: float = float(merged["min_adx"])
+        self.htf_min_adx: float = float(merged["htf_min_adx"])
         self.trend_ma_period: int = int(merged["trend_ma_period"])
         self.pullback_rsi_long: float = float(merged["pullback_rsi_long"])
         self.pullback_rsi_short: float = float(merged["pullback_rsi_short"])
@@ -110,6 +112,14 @@ class TrendBreakoutStrategy(BaseStrategy):
 
         # ADX must show trend
         if adx_val < self.min_adx:
+            return flat_signal()
+
+        # PRD §8: 4h trend filter — require higher-TF ADX confirmation.
+        # If 4h ADX is available, it must also show trending conditions.
+        htf_adx = self._safe_feat(features, "adx_4h")
+        if htf_adx is None:
+            htf_adx = self._safe_feat(features, "adx_1h")
+        if htf_adx is not None and htf_adx < self.htf_min_adx:
             return flat_signal()
 
         # Channel highs/lows over lookback

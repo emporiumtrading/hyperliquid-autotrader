@@ -18,6 +18,7 @@ _DEFAULT_CONFIG: dict = {
     "rsi_overbought": 70.0,
     "atr_multiplier_stop": 1.5,
     "max_adx": 25.0,
+    "htf_max_adx": 30.0,
     "min_confidence": 0.3,
 }
 
@@ -45,6 +46,7 @@ class RangeMeanRevStrategy(BaseStrategy):
         self.rsi_overbought: float = float(merged["rsi_overbought"])
         self.atr_multiplier_stop: float = float(merged["atr_multiplier_stop"])
         self.max_adx: float = float(merged["max_adx"])
+        self.htf_max_adx: float = float(merged["htf_max_adx"])
         self.min_confidence: float = float(merged["min_confidence"])
 
     # ------------------------------------------------------------------
@@ -107,6 +109,14 @@ class RangeMeanRevStrategy(BaseStrategy):
 
         # Only trade low-ADX (ranging) environments
         if adx_val > self.max_adx:
+            return flat_signal()
+
+        # PRD §8: 1h range filter — confirm higher-TF is also ranging.
+        # If 1h ADX is available and shows strong trend, skip mean reversion.
+        htf_adx = self._safe_feat(features, "adx_1h")
+        if htf_adx is None:
+            htf_adx = self._safe_feat(features, "adx_4h")
+        if htf_adx is not None and htf_adx > self.htf_max_adx:
             return flat_signal()
 
         # Bollinger Band width (used for proximity calculations)

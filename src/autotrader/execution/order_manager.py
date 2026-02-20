@@ -109,6 +109,7 @@ class ManagedOrder:
     tp_px: float | None = None
     parent_trade_id: str = ""
     error: str = ""
+    protective_placed: bool = False
     metadata: dict = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
@@ -246,6 +247,7 @@ class OrderManager:
 
         # If the entry was filled immediately, place stop and TP trigger orders
         if state == OrderState.FILLED:
+            managed.protective_placed = True
             self._place_protective_orders(
                 symbol=symbol,
                 side=side,
@@ -442,6 +444,24 @@ class OrderManager:
                 new_state=new_state.value,
                 filled_size=managed.filled_size,
                 filled_price=managed.filled_price,
+            )
+
+        # PRD §9.2 / §10: Place protective SL/TP on partial or full fills
+        # for entry orders that haven't had protective orders placed yet.
+        if (
+            new_state in (OrderState.PARTIAL, OrderState.FILLED)
+            and managed.order_type in ("limit", "market")
+            and not managed.protective_placed
+            and managed.filled_size > 0
+        ):
+            managed.protective_placed = True
+            self._place_protective_orders(
+                symbol=managed.symbol,
+                side=managed.side,
+                size=managed.filled_size,
+                trade_id=managed.parent_trade_id,
+                stop_px=managed.stop_px,
+                tp_px=managed.tp_px,
             )
 
     # ------------------------------------------------------------------

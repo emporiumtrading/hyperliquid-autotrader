@@ -13,6 +13,7 @@ import sys
 from autotrader.governance.registry import BaselineRegistry
 from autotrader.hl.nonces import init as init_nonces
 from autotrader.monitoring.alerts import init as init_alerts
+from autotrader.monitoring.audit import init as init_audit
 from autotrader.monitoring.logger import get_logger, setup_logging
 from autotrader.runtime.kill_switch import init as init_kill_switch
 from autotrader.runtime.scheduler import TradingScheduler
@@ -65,6 +66,7 @@ def main() -> int:
 
     # Initialize subsystems
     init_alerts(cfg.get("observability", {}).get("alert_webhook_url"))
+    init_audit(cfg.get("audit_path", "logs/audit.jsonl"))
     init_nonces(cfg.get("nonce_path", "data/nonces.json"))
     init_kill_switch(cfg.get("kill_switch_path", "data/kill_switch.json"))
 
