@@ -76,3 +76,49 @@ def compute_volume_profile(close: pd.Series, volume: pd.Series, period: int = 20
     rel_vol = volume / vol_sma
     rel_vol = rel_vol.replace([np.inf, -np.inf], np.nan)
     return rel_vol
+
+
+def compute_trade_intensity(
+    volume: pd.Series,
+    period: int = 20,
+    spike_threshold: float = 2.0,
+) -> pd.DataFrame:
+    """Compute trade intensity metrics from bar volume data.
+
+    Returns a DataFrame with columns:
+
+    * ``intensity`` -- rolling trade count / volume normalised by its
+      SMA.  Values > 1.0 indicate above-average activity.
+    * ``acceleration`` -- bar-over-bar change of ``intensity``,
+      capturing whether activity is *increasing* (positive) or
+      *waning* (negative).
+    * ``is_spike`` -- boolean flag when ``intensity`` exceeds
+      *spike_threshold* (default 2.0), useful as a filter for
+      breakout / capitulation detection.
+
+    Parameters
+    ----------
+    volume : pd.Series
+        Per-bar volume (trade count or notional).
+    period : int
+        Rolling window for the baseline SMA (default 20).
+    spike_threshold : float
+        Multiple of the SMA above which a bar is flagged as a spike.
+    """
+    vol_sma = volume.rolling(window=period, min_periods=period).mean()
+
+    intensity = volume / vol_sma
+    intensity = intensity.replace([np.inf, -np.inf], np.nan)
+
+    acceleration = intensity.diff()
+
+    is_spike = intensity >= spike_threshold
+
+    return pd.DataFrame(
+        {
+            "intensity": intensity,
+            "acceleration": acceleration,
+            "is_spike": is_spike,
+        },
+        index=volume.index,
+    )
