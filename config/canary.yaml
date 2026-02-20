@@ -2,6 +2,9 @@
 # Merges on top of base.yaml.
 env: canary
 
+universe:
+  top_n_by_liquidity: 2            # PRD §13 Stage C: 1-2 assets only
+
 risk:
   equity_risk_per_trade_min: 0.001   # half of normal min
   equity_risk_per_trade_max: 0.005   # half of normal max

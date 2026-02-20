@@ -64,6 +64,7 @@ from autotrader.features.technical import (
     wick_ratio as compute_wick_ratio,
 )
 from autotrader.governance.drift import DriftDetector
+from autotrader.monitoring import audit
 from autotrader.governance.probation import ProbationEvaluator
 from autotrader.governance.registry import BaselineRegistry
 from autotrader.hl.client import HLClient, create_client
@@ -863,6 +864,19 @@ class TradingScheduler:
             )
             return result
 
+        # h2. Correlated cluster exposure check (PRD §9.1)
+        cluster_exceeded, dominant_pct = (
+            self.exposure_tracker.max_correlated_cluster_exposure(max_cluster_pct=0.6)
+        )
+        if cluster_exceeded:
+            logger.info(
+                "scheduler.correlated_cluster_exceeded",
+                symbol=symbol,
+                dominant_pct=round(dominant_pct, 3),
+            )
+            result["approved"] = False
+            return result
+
         # i. Apply lot size / tick size rounding
         trade_id = generate_trade_id()
         raw_size = approval.get("size_coins", 0.0)
@@ -903,6 +917,22 @@ class TradingScheduler:
                 price=entry_px,
                 trade_id=trade_id,
                 order_state=managed_order.state.value,
+            )
+
+            # Audit trail (PRD §14: audit logs for every order action)
+            audit.log_event(
+                "order_placed",
+                {
+                    "trade_id": trade_id,
+                    "order_id": managed_order.order_id,
+                    "symbol": symbol,
+                    "side": approval_side,
+                    "size": size_coins,
+                    "price": entry_px,
+                    "stop": stop_px,
+                    "take_profit": tp_px,
+                    "leverage": approval.get("leverage", 0.0),
+                },
             )
 
             # Record trade for probation tracking
@@ -1286,16 +1316,22 @@ class TradingScheduler:
             )
             metrics.inc_counter("ws_orders_filled_total")
             logger.info("scheduler.ws_order_filled", oid=oid)
+            audit.log_event(
+                "order_filled",
+                {"oid": oid, "filled_sz": filled_sz, "filled_px": filled_px},
+            )
 
         elif status in ("canceled", "cancelled"):
             self.order_manager.update_order(order_id=oid, status="cancelled")
             metrics.inc_counter("ws_orders_cancelled_total")
             logger.info("scheduler.ws_order_cancelled", oid=oid)
+            audit.log_event("order_cancelled", {"oid": oid})
 
         elif status == "rejected":
             self.order_manager.update_order(order_id=oid, status="rejected")
             metrics.inc_counter("ws_orders_rejected_total")
             logger.info("scheduler.ws_order_rejected", oid=oid)
+            audit.log_event("order_cancelled", {"oid": oid, "reason": "rejected"})
 
         elif status == "open" or status == "resting":
             # Order acknowledged by exchange, no action needed

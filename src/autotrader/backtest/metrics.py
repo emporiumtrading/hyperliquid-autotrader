@@ -40,6 +40,8 @@ class BacktestMetrics:
     cvar_99: float = 0.0
     worst_day: float = 0.0
     best_day: float = 0.0
+    worst_week: float = 0.0
+    best_week: float = 0.0
     total_fees: float = 0.0
     total_slippage: float = 0.0
     total_funding: float = 0.0
@@ -254,6 +256,18 @@ def compute_metrics(
         # Best / worst day
         m.best_day = float(daily_returns.max())
         m.worst_day = float(daily_returns.min())
+
+        # Best / worst week (PRD §3.1 secondary: worst day/week)
+        if isinstance(equity_curve.index, pd.DatetimeIndex):
+            weekly_equity = equity_curve.resample("1W").last().dropna()
+        else:
+            # Approximate: 7 * 96 bars per week for 15-min bars
+            weekly_equity = equity_curve.iloc[::672] if len(equity_curve) > 672 else equity_curve
+        weekly_returns = weekly_equity.pct_change().dropna()
+        weekly_returns = weekly_returns.replace([np.inf, -np.inf], np.nan).dropna()
+        if len(weekly_returns) > 0:
+            m.best_week = float(weekly_returns.max())
+            m.worst_week = float(weekly_returns.min())
 
         # CVaR
         m.cvar_95 = _compute_cvar(daily_returns, 0.95)
