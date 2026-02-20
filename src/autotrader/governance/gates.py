@@ -34,6 +34,8 @@ class GateConfig:
     require_walkforward: bool = True
     require_robustness: bool = True
     robustness_pass_rate: float = 0.7
+    max_avg_slippage_bps: float = 5.0
+    max_orders_per_day: float = 50.0
 
 
 def load_gate_config(cfg: dict) -> GateConfig:
@@ -326,6 +328,38 @@ def evaluate_candidate(
                     f"Robustness pass rate {pass_rate:.2%} below "
                     f"threshold {config.robustness_pass_rate:.2%}"
                 )
+
+    # ------------------------------------------------------------------
+    # 9. Operational feasibility (PRD §11.3: order rate + slippage)
+    # ------------------------------------------------------------------
+    n_trades = float(_get_metric(candidate_report, "total_trades", "trade_count", default=0))
+    trading_days = float(_get_metric(candidate_report, "trading_days", "n_days", default=1))
+    if trading_days < 1:
+        trading_days = 1.0
+    orders_per_day = n_trades / trading_days
+
+    opfeas_order_ok = orders_per_day <= config.max_orders_per_day
+    gates["order_rate"] = _make_gate(
+        "order_rate", opfeas_order_ok, orders_per_day, config.max_orders_per_day,
+    )
+    if not opfeas_order_ok:
+        reasons.append(
+            f"Order rate {orders_per_day:.1f}/day exceeds limit "
+            f"{config.max_orders_per_day:.0f}/day"
+        )
+
+    avg_slippage_bps = float(
+        _get_metric(candidate_report, "avg_slippage_bps", "slippage_bps", default=0.0)
+    )
+    opfeas_slip_ok = avg_slippage_bps <= config.max_avg_slippage_bps
+    gates["slippage_acceptable"] = _make_gate(
+        "slippage_acceptable", opfeas_slip_ok, avg_slippage_bps, config.max_avg_slippage_bps,
+    )
+    if not opfeas_slip_ok:
+        reasons.append(
+            f"Avg slippage {avg_slippage_bps:.2f} bps exceeds limit "
+            f"{config.max_avg_slippage_bps:.1f} bps"
+        )
 
     # ------------------------------------------------------------------
     # Overall verdict

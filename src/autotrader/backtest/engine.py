@@ -455,6 +455,11 @@ class BacktestEngine:
         features["macd_signal"] = self._last_valid(macd_signal)
         features["macd_hist"] = self._last_valid(macd_hist)
 
+        # Funding features — backtest has no live funding data, use neutral
+        # defaults matching the scheduler's fallback (PRD §7.1 parity).
+        features["funding_zscore"] = 0.0
+        features["funding_percentile"] = 0.5
+
         return features
 
     @staticmethod

@@ -61,6 +61,9 @@ from autotrader.features.technical import (
     rsi as compute_rsi,
 )
 from autotrader.features.technical import (
+    macd as compute_macd,
+)
+from autotrader.features.technical import (
     volume_sma as compute_volume_sma,
 )
 from autotrader.features.technical import (
@@ -1089,6 +1092,7 @@ class TradingScheduler:
         # SMA 50
         _sma50 = sma(close, 50)
         features["sma_50"] = self._last_valid(_sma50)
+        features["sma"] = features["sma_50"]  # alias for backtest parity
 
         # Bollinger Bands
         bb_upper, bb_middle, bb_lower = bollinger_bands(close, period=20, num_std=2.0)
@@ -1161,6 +1165,12 @@ class TradingScheduler:
         except Exception:
             features["funding_zscore"] = 0.0
             features["funding_percentile"] = 0.5
+
+        # MACD (parity with backtest engine)
+        macd_line, macd_signal, macd_hist = compute_macd(close, fast=12, slow=26, signal=9)
+        features["macd_line"] = self._last_valid(macd_line)
+        features["macd_signal"] = self._last_valid(macd_signal)
+        features["macd_hist"] = self._last_valid(macd_hist)
 
         return features
 

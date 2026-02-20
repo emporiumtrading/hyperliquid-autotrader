@@ -48,6 +48,8 @@ class BacktestMetrics:
     net_profit: float = 0.0
     gross_profit: float = 0.0
     utility: float = 0.0
+    trading_days: float = 0.0
+    avg_slippage_bps: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +348,24 @@ def compute_metrics(
         m.net_profit = m.gross_profit - m.total_fees - m.total_slippage - m.total_funding
     else:
         m.net_profit = final_equity - initial_equity
+
+    # ------------------------------------------------------------------
+    # Operational feasibility metrics (PRD §11.3 gate 5)
+    # ------------------------------------------------------------------
+    if isinstance(equity_curve.index, pd.DatetimeIndex) and len(equity_curve) > 1:
+        span = (equity_curve.index[-1] - equity_curve.index[0]).total_seconds()
+        m.trading_days = max(span / 86400.0, 1.0)
+    elif len(equity_curve) > 1:
+        # Assume 15m bars as default signal TF
+        m.trading_days = max(len(equity_curve) * 15 / 1440.0, 1.0)
+    else:
+        m.trading_days = 1.0
+
+    if m.total_trades > 0 and m.total_slippage > 0 and m.gross_profit > 0:
+        # Compute average slippage in bps relative to avg trade notional
+        avg_trade_notional = abs(m.gross_profit + m.total_fees + m.total_slippage) / m.total_trades
+        if avg_trade_notional > 0:
+            m.avg_slippage_bps = (m.total_slippage / m.total_trades) / avg_trade_notional * 10_000
 
     # ------------------------------------------------------------------
     # Utility
