@@ -513,6 +513,29 @@ class OrderManager:
     # Trailing stop management
     # ------------------------------------------------------------------
 
+    def active_trade_symbols(self) -> list[tuple[str, str]]:
+        """Return (trade_id, symbol) for trades with filled entries and active stops.
+
+        Used by the scheduler to update trailing stops on open positions.
+        """
+        result: list[tuple[str, str]] = []
+        for trade_id, order_ids in self.trade_orders.items():
+            has_filled_entry = False
+            has_active_stop = False
+            symbol = ""
+            for oid in order_ids:
+                managed = self.orders.get(oid)
+                if managed is None:
+                    continue
+                if managed.order_type in ("limit", "market") and managed.state == OrderState.FILLED:
+                    has_filled_entry = True
+                    symbol = managed.symbol
+                if managed.order_type == "stop_loss" and managed.state in _ACTIVE_STATES:
+                    has_active_stop = True
+            if has_filled_entry and has_active_stop and symbol:
+                result.append((trade_id, symbol))
+        return result
+
     def update_trailing_stop(
         self,
         trade_id: str,

@@ -179,6 +179,23 @@ def approve_trade(
     result["size_usd"] = size_usd
 
     # ------------------------------------------------------------------
+    # 7a. Margin availability check (PRD §9.3: "Lmax from margin tables")
+    # ------------------------------------------------------------------
+    if risk_state.margin_available is not None:
+        margin_required = size_usd / leverage if leverage > 0 else size_usd
+        if margin_required > risk_state.margin_available:
+            reasons.append(
+                f"Insufficient margin: need ${margin_required:.0f} "
+                f"but only ${risk_state.margin_available:.0f} available"
+            )
+            logger.info(
+                "trade_rejected_margin",
+                margin_required=margin_required,
+                margin_available=risk_state.margin_available,
+            )
+            return result
+
+    # ------------------------------------------------------------------
     # 7b. Compute expected reward:risk if take_profit is available
     # ------------------------------------------------------------------
     expected_rr = 0.0

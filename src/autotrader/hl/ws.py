@@ -66,6 +66,7 @@ class HLWebSocket:
 
         self._running: bool = False
         self._reconnect_delay: float = 1.0
+        self.reconnect_count: int = 0  # increments on each successful reconnect
 
         # Background listener task
         self._listen_task: asyncio.Task[None] | None = None
@@ -280,7 +281,8 @@ class HLWebSocket:
 
             try:
                 await self._do_connect()
-                logger.info("ws_reconnected")
+                self.reconnect_count += 1
+                logger.info("ws_reconnected", reconnect_count=self.reconnect_count)
 
                 # Resubscribe to all active subscriptions
                 for key, sub_msg in self._subscriptions.items():

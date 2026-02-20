@@ -122,6 +122,13 @@ class WSOrderReconciler:
         """Return whether the background listener is active."""
         return self._running and self._thread is not None and self._thread.is_alive()
 
+    @property
+    def reconnect_count(self) -> int:
+        """Number of WS reconnections since start (for snapshot replay trigger)."""
+        if self._ws is not None:
+            return self._ws.reconnect_count
+        return 0
+
     # ------------------------------------------------------------------
     # Drain queues (called by the synchronous scheduler)
     # ------------------------------------------------------------------

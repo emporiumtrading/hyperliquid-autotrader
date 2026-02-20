@@ -29,7 +29,7 @@ from autotrader.data.collectors.l2book import snapshot_l2
 from autotrader.data.collectors.user_state import fetch_user_state
 from autotrader.data.transforms.resample import resample_ohlcv
 from autotrader.execution.broker import Broker
-from autotrader.execution.order_manager import OrderManager
+from autotrader.execution.order_manager import OrderManager, OrderState
 from autotrader.execution.reconciliation import Reconciler
 from autotrader.execution.ws_reconciler import WSOrderReconciler
 from autotrader.features.positioning import (
@@ -160,6 +160,7 @@ class TradingScheduler:
             ws_url=hl_cfg.get("ws_url", "wss://api.hyperliquid.xyz/ws"),
             user_address=hl_cfg.get("account_address", ""),
         )
+        self._last_ws_reconnect_count: int = 0
 
         # ---- Order chase config ----
         self._chase_timeout_sec: float = float(exec_cfg.get("chase_timeout_sec", 8.0))
@@ -257,6 +258,7 @@ class TradingScheduler:
         # ---- Equity tracking (used for RiskState) ----
         self._equity: float = float(config.get("initial_equity", 10_000.0))
         self._peak_equity: float = self._equity
+        self._margin_available: float | None = None
 
         # ---- Drift response state ----
         self._drift_reduced: bool = False
@@ -387,6 +389,13 @@ class TradingScheduler:
         # Refresh equity from user state (best-effort)
         self._update_equity()
 
+        # 2b. Post-WS-reconnect snapshot replay (PRD §10: "WS disconnect →
+        #     reconnect + snapshot replay")
+        try:
+            self._check_ws_reconnect_snapshot()
+        except Exception as exc:
+            logger.debug("scheduler.ws_snapshot_failed", error=str(exc))
+
         # Cache asset contexts for the iteration (avoid re-fetching per symbol)
         cached_ctx_df: pd.DataFrame | None = None
         try:
@@ -425,6 +434,12 @@ class TradingScheduler:
             self._chase_unfilled_orders()
         except Exception as exc:
             logger.error("scheduler.chase_failed", error=str(exc))
+
+        # 5b. Trail stops on open positions (PRD §8: "ATR stop/trail")
+        try:
+            self._trail_open_stops()
+        except Exception as exc:
+            logger.error("scheduler.trailing_stop_failed", error=str(exc))
 
         # 6. Kill switch auto-check
         risk_state = self._build_risk_state()
@@ -1250,6 +1265,62 @@ class TradingScheduler:
                 )
 
     # ------------------------------------------------------------------
+    # Trailing stop management
+    # ------------------------------------------------------------------
+
+    def _trail_open_stops(self) -> None:
+        """Update trailing stops for all open positions.
+
+        PRD §8 requires "ATR stop/trail" for TREND strategies.  This method
+        iterates over all active trades with filled entries and live stop
+        orders, then calls ``order_manager.update_trailing_stop()`` using the
+        latest price and ATR from signal-timeframe candles.
+        """
+        active = self.order_manager.active_trade_symbols()
+        if not active:
+            return
+
+        trail_multiplier = 2.0  # default trailing ATR multiplier
+
+        for trade_id, symbol in active:
+            try:
+                candles = self.store.read_candles(
+                    symbol=symbol,
+                    interval=self._signal_timeframes[0] if self._signal_timeframes else "15m",
+                    limit=30,
+                )
+                if candles is None or candles.empty or len(candles) < 14:
+                    continue
+
+                _atr = compute_atr(candles["high"], candles["low"], candles["close"], period=14)
+                atr_val = self._last_valid(_atr)
+                if atr_val is None or atr_val <= 0:
+                    continue
+
+                current_price = float(candles["close"].iloc[-1])
+                moved = self.order_manager.update_trailing_stop(
+                    trade_id=trade_id,
+                    current_price=current_price,
+                    trail_atr=atr_val,
+                    trail_multiplier=trail_multiplier,
+                )
+                if moved:
+                    logger.info(
+                        "scheduler.trailing_stop_moved",
+                        trade_id=trade_id,
+                        symbol=symbol,
+                        price=current_price,
+                        atr=round(atr_val, 4),
+                    )
+            except Exception as exc:
+                logger.debug(
+                    "scheduler.trail_stop_error",
+                    trade_id=trade_id,
+                    symbol=symbol,
+                    error=str(exc),
+                )
+
+    # ------------------------------------------------------------------
     # Drift response
     # ------------------------------------------------------------------
 
@@ -1295,6 +1366,61 @@ class TradingScheduler:
         else:
             # Drift cleared -- allow trading again
             self._drift_reduced = False
+
+    # ------------------------------------------------------------------
+    # WS reconnect snapshot
+    # ------------------------------------------------------------------
+
+    def _check_ws_reconnect_snapshot(self) -> None:
+        """After a WS reconnect, fetch open orders + positions via REST.
+
+        PRD §10: "WS disconnect → reconnect + snapshot replay."
+        This ensures no fills or status changes were missed during the
+        disconnection window.
+        """
+        current_count = self.ws_reconciler.reconnect_count
+        if current_count <= self._last_ws_reconnect_count:
+            return
+
+        self._last_ws_reconnect_count = current_count
+        logger.info(
+            "scheduler.ws_reconnect_snapshot",
+            reconnect_count=current_count,
+        )
+        metrics.inc_counter("ws_reconnect_snapshots_total")
+
+        # Re-fetch open orders to verify pending order states
+        try:
+            open_orders = self.client.get_open_orders()
+            live_oids = {str(o.get("oid", "")) for o in open_orders}
+
+            # Mark any managed orders that are no longer on the exchange
+            for oid, managed in self.order_manager.orders.items():
+                if (
+                    managed.state in (OrderState.SUBMITTED, OrderState.PARTIAL)
+                    and oid not in live_oids
+                ):
+                    logger.info(
+                        "scheduler.snapshot_order_gone",
+                        oid=oid,
+                        symbol=managed.symbol,
+                    )
+                    self.order_manager.update_order(oid, "cancelled", 0.0, 0.0)
+
+            logger.info(
+                "scheduler.ws_snapshot_complete",
+                open_orders=len(open_orders),
+            )
+        except Exception as exc:
+            logger.warning("scheduler.ws_snapshot_orders_failed", error=str(exc))
+
+        # Re-fetch recent fills to catch any missed during disconnect
+        try:
+            fills = self.client.get_user_fills()
+            if fills:
+                self._apply_rest_fills(fills[-20:])
+        except Exception as exc:
+            logger.warning("scheduler.ws_snapshot_fills_failed", error=str(exc))
 
     # ------------------------------------------------------------------
     # Reconciliation
@@ -1439,6 +1565,11 @@ class TradingScheduler:
                 self._equity = account_value
                 self._peak_equity = max(self._peak_equity, self._equity)
 
+            # Track available margin for leverage validation (PRD §9.3)
+            withdrawable = user_state.get("withdrawable", None)
+            if withdrawable is not None:
+                self._margin_available = float(withdrawable)
+
             positions = user_state.get("positions", [])
             if positions:
                 self.reconciler.sync_positions(positions)
@@ -1450,9 +1581,11 @@ class TradingScheduler:
 
     def _build_risk_state(self) -> RiskState:
         """Construct the current :class:`RiskState` from live data."""
-        return self.exposure_tracker.to_risk_state(
+        state = self.exposure_tracker.to_risk_state(
             equity=self._equity,
             peak_equity=self._peak_equity,
             daily_pnl=self.reconciler.get_daily_pnl(),
             weekly_pnl=self.reconciler.get_weekly_pnl(),
         )
+        state.margin_available = self._margin_available
+        return state

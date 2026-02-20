@@ -53,6 +53,7 @@ class RiskState:
     weekly_pnl: float = 0.0
     open_positions: int = 0
     total_notional: float = 0.0
+    margin_available: float | None = None  # from clearinghouseState.withdrawable
 
 
 # ---------------------------------------------------------------------------
