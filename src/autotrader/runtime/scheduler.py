@@ -463,6 +463,37 @@ class TradingScheduler:
                 self.broker.cancel_all()
             except Exception:
                 logger.error("scheduler.cancel_all_on_kill_failed")
+            # Flatten all open positions (PRD §9.1: kill switch must close positions)
+            try:
+                open_positions = [
+                    {
+                        "symbol": p.symbol,
+                        "side": p.side,
+                        "size": p.size,
+                        "current_px": p.current_px,
+                    }
+                    for p in self.exposure_tracker.positions.values()
+                ]
+                if open_positions:
+                    close_results = self.broker.close_all_positions(open_positions)
+                    for cr in close_results:
+                        if cr.status == "filled":
+                            self.exposure_tracker.remove_position(cr.order_id)
+                            audit.log_event(
+                                "position_closed",
+                                {
+                                    "order_id": cr.order_id,
+                                    "reason": "kill_switch",
+                                    "filled_px": cr.filled_px,
+                                    "filled_sz": cr.filled_sz,
+                                },
+                            )
+                    logger.info(
+                        "scheduler.kill_switch_positions_closed",
+                        count=len(open_positions),
+                    )
+            except Exception:
+                logger.error("scheduler.close_positions_on_kill_failed")
 
         # 7. Probation evaluation (canary mode)
         if self.probation is not None:
@@ -1518,6 +1549,33 @@ class TradingScheduler:
                 "order_filled",
                 {"oid": oid, "filled_sz": filled_sz, "filled_px": filled_px},
             )
+
+            # Audit position lifecycle (PRD §14)
+            if managed is not None:
+                is_close = getattr(managed, "reduce_only", False) or managed.order_type in ("stop_loss", "take_profit")
+                if is_close:
+                    audit.log_event(
+                        "position_closed",
+                        {
+                            "oid": oid,
+                            "symbol": managed.symbol,
+                            "side": managed.side,
+                            "size": filled_sz,
+                            "close_px": filled_px,
+                            "order_type": managed.order_type,
+                        },
+                    )
+                else:
+                    audit.log_event(
+                        "position_opened",
+                        {
+                            "oid": oid,
+                            "symbol": managed.symbol,
+                            "side": managed.side,
+                            "size": filled_sz,
+                            "entry_px": filled_px,
+                        },
+                    )
 
             # Feed drift detector with fill observation (PRD §12.2)
             managed = self.order_manager.orders.get(oid)

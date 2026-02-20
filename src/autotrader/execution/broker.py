@@ -544,6 +544,79 @@ class Broker:
             return count
 
     # ------------------------------------------------------------------
+    # Emergency position closure (kill switch support)
+    # ------------------------------------------------------------------
+
+    def close_all_positions(
+        self,
+        positions: list[dict[str, Any]] | None = None,
+    ) -> list[OrderResult]:
+        """Market-close all open positions for kill switch scenarios.
+
+        Parameters
+        ----------
+        positions:
+            List of position dicts with keys ``symbol``, ``side``, ``size``.
+            If ``None``, returns an empty list (caller should provide the
+            position list from the exposure tracker).
+
+        Returns
+        -------
+        list[OrderResult]
+            Results for each close order attempted.
+        """
+        if not positions:
+            return []
+
+        results: list[OrderResult] = []
+        for pos in positions:
+            symbol = pos.get("symbol", "")
+            side = pos.get("side", "")
+            size = float(pos.get("size", 0.0))
+            price = float(pos.get("current_px", pos.get("price", 0.0)))
+
+            if size <= 0 or not symbol:
+                continue
+
+            # Reverse the position direction
+            close_side = "sell" if side == "long" else "buy"
+
+            logger.info(
+                "close_position_emergency",
+                symbol=symbol,
+                side=close_side,
+                size=size,
+            )
+
+            try:
+                result = self.place_order(
+                    symbol=symbol,
+                    side=close_side,
+                    size=size,
+                    price=price,
+                    order_type="market",
+                    reduce_only=True,
+                    tif="Ioc",
+                )
+                results.append(result)
+            except Exception as exc:
+                logger.error(
+                    "close_position_emergency_failed",
+                    symbol=symbol,
+                    error=str(exc),
+                )
+                results.append(
+                    OrderResult(
+                        order_id="",
+                        status="rejected",
+                        error=str(exc),
+                        timestamp_ms=now_ms(),
+                    )
+                )
+
+        return results
+
+    # ------------------------------------------------------------------
     # Trigger orders (stop-loss / take-profit)
     # ------------------------------------------------------------------
 

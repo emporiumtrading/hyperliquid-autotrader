@@ -56,11 +56,13 @@ strategy:
   #     trend_breakout: 1.0
   #     funding_extremes: 0.5
 
+initial_equity: 10000.0
+
 execution:
   prefer_maker: true
   max_slippage_bps: 5.0
-  max_order_retries: 3
-  chase_seconds: 8
+  chase_max_retries: 3
+  chase_timeout_sec: 8
   post_only_on_entries: true
 
 governance:

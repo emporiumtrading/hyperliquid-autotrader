@@ -64,22 +64,28 @@ class TokenBucket:
     # Public API
     # ------------------------------------------------------------------
 
-    def acquire(self, weight: float = 1.0) -> None:
+    def acquire(self, weight: float = 1.0, timeout: float = 60.0) -> None:
         """Block until *weight* tokens are available, then consume them.
 
         Parameters
         ----------
         weight : float
             Number of tokens (API weight units) to consume.
+        timeout : float
+            Maximum seconds to wait.  Raises :class:`TimeoutError` if the
+            budget cannot be acquired within this period.  Defaults to 60 s.
 
         Raises
         ------
         ValueError
             If *weight* exceeds the bucket capacity (would never be satisfied).
+        TimeoutError
+            If tokens are not available within *timeout* seconds.
         """
         if weight > self._capacity:
             raise ValueError(f"Requested weight {weight} exceeds bucket capacity {self._capacity}")
 
+        deadline = time.monotonic() + timeout
         while True:
             with self._lock:
                 self._refill()
@@ -90,8 +96,14 @@ class TokenBucket:
                 deficit = weight - self._tokens
                 wait_time = deficit / self._refill_rate
 
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"Rate limit acquire timed out after {timeout}s "
+                    f"waiting for {weight} tokens"
+                )
             # Sleep outside the lock so other threads can proceed
-            time.sleep(wait_time)
+            time.sleep(min(wait_time, remaining))
 
     def try_acquire(self, weight: float = 1.0) -> bool:
         """Try to consume *weight* tokens without blocking.
