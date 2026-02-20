@@ -377,3 +377,59 @@ def compute_metrics(
     )
 
     return m
+
+
+# ---------------------------------------------------------------------------
+# Per-regime metrics breakdown (PRD §11.2)
+# ---------------------------------------------------------------------------
+
+
+def compute_metrics_per_regime(trades: pd.DataFrame) -> dict[str, dict]:
+    """Compute basic trade-level metrics broken down by regime.
+
+    Parameters
+    ----------
+    trades : pd.DataFrame
+        Trade ledger with a ``regime`` column (and ``pnl``, ``fees``,
+        ``slippage``, ``funding``, ``side``, ``holding_bars``).
+
+    Returns
+    -------
+    dict[str, dict]
+        Mapping of regime label to a dict of per-regime summary stats.
+    """
+    if trades is None or trades.empty or "regime" not in trades.columns:
+        return {}
+
+    result: dict[str, dict] = {}
+    for regime, group in trades.groupby("regime"):
+        if not regime:
+            continue
+        pnl = group["pnl"].astype(float) if "pnl" in group.columns else pd.Series(dtype=float)
+        wins = pnl[pnl > 0]
+        losses = pnl[pnl < 0]
+        total = len(group)
+
+        fees = float(group["fees"].astype(float).sum()) if "fees" in group.columns else 0.0
+        slippage = float(group["slippage"].astype(float).sum()) if "slippage" in group.columns else 0.0
+        funding = float(group["funding"].astype(float).sum()) if "funding" in group.columns else 0.0
+        net_pnl = float(pnl.sum()) - fees - slippage - funding
+
+        result[str(regime)] = {
+            "total_trades": total,
+            "win_rate": float(len(wins)) / max(total, 1),
+            "avg_pnl": float(pnl.mean()) if total > 0 else 0.0,
+            "total_pnl": float(pnl.sum()),
+            "net_pnl": net_pnl,
+            "profit_factor": (
+                float(wins.sum()) / abs(float(losses.sum()))
+                if len(losses) > 0 and abs(float(losses.sum())) > 1e-12
+                else (float("inf") if len(wins) > 0 else 0.0)
+            ),
+            "avg_holding_bars": int(group["holding_bars"].mean()) if "holding_bars" in group.columns else 0,
+            "total_fees": fees,
+            "total_slippage": slippage,
+            "total_funding": funding,
+        }
+
+    return result

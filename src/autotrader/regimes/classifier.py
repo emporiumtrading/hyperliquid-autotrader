@@ -103,20 +103,27 @@ class RegimeClassifier:
 
         return score
 
-    def _score_range(self, adx: float, hurst: float, bb_width_pct: float, rsi: float) -> float:
+    def _score_range(
+        self, adx: float, hurst: float, bb_width_pct: float, rsi: float,
+        half_life: float | None = None,
+    ) -> float:
         score = 0.0
 
-        # Low ADX (0-0.30)
+        # Low ADX (0-0.25)
         if adx < self.adx_range_threshold:
-            score += 0.15 + 0.15 * min((self.adx_range_threshold - adx) / 20.0, 1.0)
+            score += 0.12 + 0.13 * min((self.adx_range_threshold - adx) / 20.0, 1.0)
 
-        # Low hurst (0-0.25)
+        # Low hurst (0-0.20)
         if hurst < self.hurst_range_threshold:
-            score += 0.10 + 0.15 * min((self.hurst_range_threshold - hurst) / 0.4, 1.0)
+            score += 0.08 + 0.12 * min((self.hurst_range_threshold - hurst) / 0.4, 1.0)
 
-        # Low BB width percentile (0-0.25)
+        # Low BB width percentile (0-0.20)
         if bb_width_pct < 0.3:
-            score += 0.10 + 0.15 * min((0.3 - bb_width_pct) / 0.3, 1.0)
+            score += 0.08 + 0.12 * min((0.3 - bb_width_pct) / 0.3, 1.0)
+
+        # Short mean-reversion half-life (0-0.15) — PRD §7.1
+        if half_life is not None and half_life < 30.0:
+            score += 0.05 + 0.10 * min((30.0 - half_life) / 30.0, 1.0)
 
         # RSI near 50 (0-0.20)
         if 35.0 <= rsi <= 65.0:
@@ -245,11 +252,12 @@ class RegimeClassifier:
             ma_slope = 0.0
         if wick_ratio is None:
             wick_ratio = 1.0
+        half_life = self._safe_get(features, "half_life")
 
         # Compute scores
         scores: dict[str, float] = {
             "TREND": self._score_trend(adx, hurst, ma_slope, rsi),
-            "RANGE": self._score_range(adx, hurst, bb_width_pct, rsi),
+            "RANGE": self._score_range(adx, hurst, bb_width_pct, rsi, half_life),
             "VOLATILE_BREAKOUT": self._score_volatile_breakout(
                 adx, bb_width_pct, vol_ratio, realized_vol
             ),

@@ -46,6 +46,7 @@ from autotrader.features.technical import (
     bb_width_percentile,
     bollinger_bands,
     hurst_exponent,
+    mean_reversion_half_life,
     sma,
 )
 from autotrader.features.technical import (
@@ -803,6 +804,7 @@ class TradingScheduler:
         raw_regime = regime_result["regime"]
         raw_confidence = regime_result["confidence"]
         expected_slippage_bps = regime_result.get("expected_slippage_bps", 1.0)
+        self._last_expected_slippage_bps = expected_slippage_bps  # for drift detector
         effective_regime = self.hysteresis.update(raw_regime, raw_confidence)
         effective_confidence = self.hysteresis.current_confidence
 
@@ -1134,6 +1136,13 @@ class TradingScheduler:
         # Hurst exponent
         _hurst = hurst_exponent(close, max_lag=20)
         features["hurst"] = self._last_valid(_hurst)
+
+        # Mean-reversion half-life (PRD §7.1)
+        if len(close) >= 50:
+            _hl = mean_reversion_half_life(close, lookback=50)
+            features["half_life"] = self._last_valid(_hl)
+        else:
+            features["half_life"] = None
 
         # Volume SMA
         _vsma = compute_volume_sma(volume, period=20)
@@ -1509,6 +1518,26 @@ class TradingScheduler:
                 "order_filled",
                 {"oid": oid, "filled_sz": filled_sz, "filled_px": filled_px},
             )
+
+            # Feed drift detector with fill observation (PRD §12.2)
+            managed = self.order_manager.orders.get(oid)
+            if managed is not None and managed.order_type in ("limit", "market"):
+                expected_px = managed.price if managed.price > 0 else filled_px
+                realized_slip = abs(filled_px - expected_px) / expected_px * 10_000 if expected_px > 0 else 0.0
+                expected_slip = getattr(self, "_last_expected_slippage_bps", 1.0)
+                regime = self.hysteresis.current_regime if hasattr(self, "hysteresis") else "UNKNOWN"
+                try:
+                    self.drift_detector.add_observation(
+                        timestamp_ms=now_ms(),
+                        expected_pnl=0.0,
+                        realized_pnl=0.0,
+                        expected_slippage=expected_slip,
+                        realized_slippage=realized_slip,
+                        predicted_regime=regime,
+                        actual_outcome=regime,
+                    )
+                except Exception:
+                    pass
 
         elif status in ("canceled", "cancelled"):
             self.order_manager.update_order(order_id=oid, status="cancelled")

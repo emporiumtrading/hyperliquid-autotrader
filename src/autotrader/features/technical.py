@@ -293,6 +293,42 @@ def hurst_exponent(close: pd.Series, max_lag: int = 20) -> pd.Series:
 
 
 # ---------------------------------------------------------------------------
+# Mean-Reversion Half-Life (Ornstein–Uhlenbeck)
+# ---------------------------------------------------------------------------
+
+
+def mean_reversion_half_life(close: pd.Series, lookback: int = 50) -> pd.Series:
+    """Rolling estimate of the mean-reversion half-life using an AR(1) model.
+
+    The half-life is defined as ``-ln(2) / ln(beta)`` where *beta* is the
+    OLS slope of ``Δy_t`` on ``y_{t-1}`` (de-meaned price).  A smaller
+    half-life indicates faster mean reversion.
+
+    Returns ``NaN`` when *beta* >= 0 (no mean reversion detected) or when
+    insufficient data is available.
+    """
+    log_ret = np.log(close / close.shift(1))
+
+    def _half_life(window: np.ndarray) -> float:
+        y = window[1:]
+        y_lag = window[:-1]
+        if len(y) < 10:
+            return np.nan
+        y_lag_dm = y_lag - np.mean(y_lag)
+        dy = y - y_lag
+        denom = np.dot(y_lag_dm, y_lag_dm)
+        if denom < 1e-15:
+            return np.nan
+        beta = np.dot(y_lag_dm, dy) / denom
+        if beta >= 0:
+            return np.nan  # not mean-reverting
+        hl = -np.log(2) / np.log(1 + beta)
+        return max(1.0, min(hl, 500.0))  # clamp to sensible range
+
+    return close.rolling(window=lookback, min_periods=lookback).apply(_half_life, raw=True)
+
+
+# ---------------------------------------------------------------------------
 # Volume
 # ---------------------------------------------------------------------------
 

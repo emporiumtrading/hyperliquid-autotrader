@@ -14,7 +14,7 @@ import pandas as pd
 import structlog
 
 from autotrader.backtest.cost_model import CostConfig, CostModel
-from autotrader.backtest.metrics import compute_metrics
+from autotrader.backtest.metrics import compute_metrics, compute_metrics_per_regime
 from autotrader.features.technical import (
     adx as compute_adx,
 )
@@ -25,6 +25,7 @@ from autotrader.features.technical import (
     bb_width_percentile,
     bollinger_bands,
     hurst_exponent,
+    mean_reversion_half_life,
     sma,
 )
 from autotrader.features.technical import (
@@ -91,6 +92,7 @@ class TradeRecord:
     exit_reason: str = ""
     stop: float = 0.0
     take_profit: float = 0.0
+    regime: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +326,7 @@ class BacktestEngine:
                     )
 
                     if approval.get("approved", False):
-                        self._open_trade(signal, approval, ts, symbol, open_trades)
+                        self._open_trade(signal, approval, ts, symbol, open_trades, regime=effective_regime)
 
             # ----- 9. Increment holding bars for open trades -----
             for ot in open_trades.values():
@@ -437,6 +439,13 @@ class BacktestEngine:
         # Hurst exponent
         _hurst = hurst_exponent(close, max_lag=20)
         features["hurst"] = self._last_valid(_hurst)
+
+        # Mean-reversion half-life (PRD §7.1)
+        if len(close) >= 50:
+            _hl = mean_reversion_half_life(close, lookback=50)
+            features["half_life"] = self._last_valid(_hl)
+        else:
+            features["half_life"] = None
 
         # Volume SMA
         _vsma = compute_volume_sma(volume, period=20)
@@ -564,6 +573,7 @@ class BacktestEngine:
         timestamp_ms: int,
         symbol: str,
         open_trades: dict[str, TradeRecord],
+        regime: str = "",
     ) -> None:
         """Record a new trade opening from an approved signal.
 
@@ -613,6 +623,7 @@ class BacktestEngine:
             take_profit=self._round_price(symbol, signal.take_profit) if signal.take_profit else 0.0,
             fees=entry_fee,
             slippage=entry_slip,
+            regime=regime,
         )
 
         open_trades[trade_id] = trade
@@ -740,6 +751,7 @@ class BacktestEngine:
                     "exit_reason",
                     "stop",
                     "take_profit",
+                    "regime",
                 ]
             )
 
@@ -752,6 +764,7 @@ class BacktestEngine:
 
         # Compute metrics
         metrics = compute_metrics(equity_curve, trades_df)
+        regime_metrics = compute_metrics_per_regime(trades_df)
 
         logger.info(
             "backtest_complete",
@@ -770,6 +783,7 @@ class BacktestEngine:
             "trades": trades_df,
             "equity_curve": equity_curve,
             "metrics": metrics,
+            "regime_metrics": regime_metrics,
             "regime_history": regime_history,
             "config": config,
         }
