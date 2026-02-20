@@ -165,7 +165,7 @@ class Broker:
         -------
         OrderResult
         """
-        if self.mode == "paper":
+        if self.mode not in ("live", "canary"):
             return self._paper_place(
                 symbol,
                 side,
@@ -459,7 +459,7 @@ class Broker:
         bool
             ``True`` if the cancellation succeeded, ``False`` otherwise.
         """
-        if self.mode == "paper":
+        if self.mode not in ("live", "canary"):
             removed = self._pending_orders.pop(order_id, None)
             if removed is not None:
                 logger.info("paper_cancel", order_id=order_id, symbol=symbol)

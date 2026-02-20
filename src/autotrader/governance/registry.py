@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import structlog
@@ -11,6 +12,20 @@ from autotrader.utils.serialization import load_json, save_json
 from autotrader.utils.time import ms_to_datetime, now_ms
 
 logger = structlog.get_logger(__name__)
+
+
+def _auto_git_commit() -> str:
+    """Return current git commit hash, or empty string if unavailable."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except Exception:
+        return ""
 
 
 class BaselineRegistry:
@@ -127,6 +142,8 @@ class BaselineRegistry:
 
         if not run_id:
             run_id = generate_run_id()
+        if not git_commit:
+            git_commit = _auto_git_commit()
 
         baseline = {
             "version": version,

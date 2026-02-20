@@ -179,21 +179,36 @@ def approve_trade(
     result["size_usd"] = size_usd
 
     # ------------------------------------------------------------------
-    # 7a. Margin availability check (PRD §9.3: "Lmax from margin tables")
+    # 7a. Margin availability check (PRD §9.3: reduce notional or skip)
     # ------------------------------------------------------------------
     if risk_state.margin_available is not None:
         margin_required = size_usd / leverage if leverage > 0 else size_usd
         if margin_required > risk_state.margin_available:
-            reasons.append(
-                f"Insufficient margin: need ${margin_required:.0f} "
-                f"but only ${risk_state.margin_available:.0f} available"
-            )
-            logger.info(
-                "trade_rejected_margin",
-                margin_required=margin_required,
-                margin_available=risk_state.margin_available,
-            )
-            return result
+            # Try reducing notional to fit available margin (PRD §9.3)
+            affordable_usd = risk_state.margin_available * (leverage if leverage > 0 else 1.0)
+            # Only accept if reduced size is at least 25% of original
+            if affordable_usd >= size_usd * 0.25 and affordable_usd > 0:
+                size_usd = affordable_usd
+                size_coins = size_usd / entry if entry > 0 else 0.0
+                result["size_coins"] = size_coins
+                result["size_usd"] = size_usd
+                logger.info(
+                    "trade_size_reduced_margin",
+                    original_margin=margin_required,
+                    available=risk_state.margin_available,
+                    new_size_usd=size_usd,
+                )
+            else:
+                reasons.append(
+                    f"Insufficient margin: need ${margin_required:.0f} "
+                    f"but only ${risk_state.margin_available:.0f} available"
+                )
+                logger.info(
+                    "trade_rejected_margin",
+                    margin_required=margin_required,
+                    margin_available=risk_state.margin_available,
+                )
+                return result
 
     # ------------------------------------------------------------------
     # 7b. Compute expected reward:risk if take_profit is available
