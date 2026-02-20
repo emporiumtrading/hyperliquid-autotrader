@@ -1294,10 +1294,12 @@ class TradingScheduler:
 
         for trade_id, symbol in active:
             try:
+                # Use the correct store API: read_candles(symbol, timeframe, start_ms, end_ms)
                 candles = self.store.read_candles(
                     symbol=symbol,
-                    interval=self._signal_timeframes[0] if self._signal_timeframes else "15m",
-                    limit=30,
+                    timeframe=self._signal_timeframe,
+                    start_ms=0,
+                    end_ms=now_ms(),
                 )
                 if candles is None or candles.empty or len(candles) < 14:
                     continue
@@ -1405,7 +1407,7 @@ class TradingScheduler:
             live_oids = {str(o.get("oid", "")) for o in open_orders}
 
             # Mark any managed orders that are no longer on the exchange
-            for oid, managed in self.order_manager.orders.items():
+            for oid, managed in list(self.order_manager.orders.items()):
                 if (
                     managed.state in (OrderState.SUBMITTED, OrderState.PARTIAL)
                     and oid not in live_oids
@@ -1435,6 +1437,19 @@ class TradingScheduler:
     # ------------------------------------------------------------------
     # Reconciliation
     # ------------------------------------------------------------------
+
+    def _apply_rest_fills(self, fills: list[dict]) -> None:
+        """Process a list of REST fills through the reconciler.
+
+        Used by the post-WS-reconnect snapshot to catch any fills
+        that were missed during the disconnection window.
+        """
+        for fill in fills:
+            try:
+                self.reconciler.process_fill(fill)
+                self._emit_fill_metrics(fill)
+            except Exception as exc:
+                logger.debug("scheduler.apply_rest_fill_failed", error=str(exc))
 
     def _reconcile_fills(self) -> None:
         """Reconcile order state using WS orderUpdates + REST fills.
