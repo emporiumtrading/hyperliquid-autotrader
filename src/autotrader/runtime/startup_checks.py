@@ -82,14 +82,17 @@ def validate_config_schema(config: dict) -> list[str]:
     # timeframes checks
     timeframes = config.get("timeframes", None)
     if timeframes is not None:
-        if isinstance(timeframes, list):
+        if isinstance(timeframes, dict):
+            # Dict form with regime/signal/execution keys is the preferred format
+            pass
+        elif isinstance(timeframes, list):
             if len(timeframes) == 0:
                 errors.append("Config 'timeframes' list is empty")
         elif isinstance(timeframes, str):
             # Single timeframe string is acceptable
             pass
         else:
-            errors.append("Config 'timeframes' must be a list or string")
+            errors.append("Config 'timeframes' must be a dict, list, or string")
 
     return errors
 

@@ -15,6 +15,7 @@ from autotrader.hl.nonces import init as init_nonces
 from autotrader.monitoring.alerts import init as init_alerts
 from autotrader.monitoring.audit import init as init_audit
 from autotrader.monitoring.logger import get_logger, setup_logging
+from autotrader.monitoring.metrics_server import MetricsServer
 from autotrader.runtime.kill_switch import init as init_kill_switch
 from autotrader.runtime.scheduler import TradingScheduler
 from autotrader.runtime.startup_checks import run_startup_checks
@@ -100,6 +101,11 @@ def main() -> int:
         logger.error("unknown_env", env=env)
         return 1
 
+    # Start Prometheus metrics HTTP server (PRD §13: observability)
+    prom_port = int(cfg.get("observability", {}).get("prometheus_port", 9109))
+    metrics_server = MetricsServer(port=prom_port)
+    metrics_server.start()
+
     scheduler = TradingScheduler(cfg)
 
     # Register SIGTERM handler so containers / systemd can shut down
@@ -115,6 +121,8 @@ def main() -> int:
     except KeyboardInterrupt:
         logger.info("shutdown_requested")
         scheduler.shutdown()
+    finally:
+        metrics_server.stop()
     return 0
 
 

@@ -1550,6 +1550,9 @@ class TradingScheduler:
                 {"oid": oid, "filled_sz": filled_sz, "filled_px": filled_px},
             )
 
+            # Look up managed order (needed for audit + drift)
+            managed = self.order_manager.orders.get(oid)
+
             # Audit position lifecycle (PRD §14)
             if managed is not None:
                 is_close = getattr(managed, "reduce_only", False) or managed.order_type in ("stop_loss", "take_profit")
@@ -1578,7 +1581,6 @@ class TradingScheduler:
                     )
 
             # Feed drift detector with fill observation (PRD §12.2)
-            managed = self.order_manager.orders.get(oid)
             if managed is not None and managed.order_type in ("limit", "market"):
                 expected_px = managed.price if managed.price > 0 else filled_px
                 realized_slip = abs(filled_px - expected_px) / expected_px * 10_000 if expected_px > 0 else 0.0
