@@ -20,6 +20,10 @@ data/processed/
 data/manifests/
 reports/
 
+# Runtime logs
+audit_trail.jsonl
+logs/
+
 # IDE
 .idea/
 .vscode/
